@@ -1,6 +1,18 @@
 # lowpaper
 
-Video wallpapers for Linux, light enough for a 2008 laptop. One bash script; mpv does the rendering, lowpaper puts it beneath your desktop icons and pauses it whenever it can't be seen.
+Ultra-lightweight, low-resource video wallpaper for Linux, designed for low-end and old hardware.
+
+A minimal Bash script around mpv, with automatic pausing when the wallpaper is not visible.
+
+![lowpaper playing a video wallpaper on XFCE, with Task Manager showing its processes](docs/demo.gif)
+
+- **Lightweight / low resource**: ~2% of one CPU core while playing, 0% when covered. See [Measured](#measured).
+- **Runs on low-end, old hardware**: tested on a Core2 Duo with no hardware video decoding.
+- **Minimal**: one bash script, no daemon, no GUI, no Electron.
+- **Built on mpv**: a mature, light player does the decoding; lowpaper only places and pauses it.
+- **Video wallpaper, image or slideshow**: mp4/webm/gif/jpg/png, or a whole folder.
+- **X11 and Wayland**: XFCE, MATE, Cinnamon, Sway, Hyprland, KDE.
+- **Pauses itself** when a fullscreen or maximized window covers the desktop.
 
 ## Install
 ```sh
@@ -11,8 +23,8 @@ install -Dm755 lowpaper/lowpaper ~/.local/bin/lowpaper
 
 ## Usage
 ```sh
-lowpaper ~/Videos/rain.mp4        # video wallpaper (looped, muted, audio not even decoded)
-lowpaper ~/Pictures/sky.jpg       # single image: on XFCE the desktop shows it, nothing stays running
+lowpaper ~/Videos/rain.mp4        
+lowpaper ~/Pictures/sky.jpg       
 lowpaper -i 600 -s ~/Pictures     # folder = slideshow; -i image interval in seconds, -s shuffle
 lowpaper -f fit video.mp4         # fill (default, crop) | fit (letterbox) | stretch
 lowpaper -o HDMI-1 video.mp4      # one monitor only
@@ -49,6 +61,3 @@ Linux Mint 22.3 XFCE/X11, Core2 Duo P8600, GeForce 320M (nouveau, no usable hwde
 
 ## Known limits
 - After a resolution or monitor change, or if xfdesktop restarts on its own, run `lowpaper restore`.
-
-## License
-MIT
