@@ -49,3 +49,6 @@ Linux Mint 22.3 XFCE/X11, Core2 Duo P8600, GeForce 320M (nouveau, no usable hwde
 
 ## Known limits
 - After a resolution or monitor change, or if xfdesktop restarts on its own, run `lowpaper restore`.
+
+## License
+MIT
