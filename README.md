@@ -17,8 +17,8 @@ A minimal Bash script around mpv, with automatic pausing when the wallpaper is n
 ## Install
 ```sh
 sudo apt install mpv
-git clone https://github.com/Meinianda-L/lowpaper.git
-install -Dm755 lowpaper/lowpaper ~/.local/bin/lowpaper
+git clone https://github.com/Meinianda-L/lowpaper-live-wallpaper.git
+install -Dm755 lowpaper-live-wallpaper/lowpaper ~/.local/bin/lowpaper
 ```
 
 ## Usage
