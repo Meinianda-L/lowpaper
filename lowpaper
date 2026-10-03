@@ -1,0 +1,375 @@
+#!/usr/bin/env bash
+# lowpaper: a video/image wallpaper engine light enough for old hardware.
+# mpv does all decoding and rendering; lowpaper only puts it under the desktop and controls it.
+# X11: a one-shot python helper creates a desktop-layer window and exits (nothing stays resident).
+#      On XFCE, xfdesktop is restarted with an alpha channel so its icons stay above the video.
+# Wayland: mpvpaper (libmpv + layer-shell).
+set -u
+PATH=$HOME/.local/bin:$PATH
+SELF=$(readlink -f "$0")
+CFG=${XDG_CONFIG_HOME:-$HOME/.config}/lowpaper
+RUN=${XDG_RUNTIME_DIR:-/tmp}/lowpaper-$(id -u)
+CONF=$CFG/config STATE=$RUN/state LIST=$RUN/playlist.m3u AUTOSTART=$HOME/.config/autostart/lowpaper.desktop
+mkdir -p "$CFG" "$RUN"
+FIT=fill INTERVAL=300 SHUFFLE=0 AUDIO=0 AUTOPAUSE=1 HWDEC= CACHE_MB=256 ICONS=1
+[ -f "$CONF" ] && . "$CONF"
+
+VIDEO='mp4|mkv|webm|mov|avi|m4v|gif'
+IMAGE='jpg|jpeg|png|webp|bmp|avif|jxl|tif|tiff'
+
+die() { echo "lowpaper: $*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+conf_set() { touch "$CONF"; sed -i "/^$1=/d" "$CONF"; echo "$1=$2" >> "$CONF"; eval "$1=\$2"; }
+is_media() { [[ ${1,,} =~ \.($VIDEO|$IMAGE)$ ]]; }
+is_image() { [[ ${1,,} =~ \.($IMAGE)$ ]]; }
+
+py() {  # py win X Y W H [under] -> window id   |   py ipc SOCKET REQUESTS -> raw replies (fallback when nc lacks -U)
+python3 - "$@" <<'PY'
+import sys
+if sys.argv[1] == "ipc":
+    import socket
+    s = socket.socket(socket.AF_UNIX); s.settimeout(1); s.connect(sys.argv[2])
+    s.sendall(sys.argv[3].encode() + b"\n"); want = sys.argv[3].count("\n") + 1
+    for line in s.makefile():
+        print(line, end=""); want -= '"request_id"' in line
+        if not want: break
+    sys.exit()
+
+import ctypes as C, time
+X = C.CDLL("libX11.so.6"); E = C.CDLL("libXext.so.6")
+vp, ul, i, u = C.c_void_p, C.c_ulong, C.c_int, C.c_uint
+X.XOpenDisplay.restype = vp; X.XOpenDisplay.argtypes = [C.c_char_p]
+X.XDefaultRootWindow.restype = ul; X.XDefaultRootWindow.argtypes = [vp]
+X.XCreateSimpleWindow.restype = ul; X.XCreateSimpleWindow.argtypes = [vp, ul, i, i, u, u, u, ul, ul]
+X.XInternAtom.restype = ul; X.XInternAtom.argtypes = [vp, C.c_char_p, i]
+X.XChangeProperty.argtypes = [vp, ul, ul, ul, i, i, vp, i]
+X.XMapWindow.argtypes = [vp, ul]
+X.XStoreName.argtypes = [vp, ul, C.c_char_p]
+X.XSetCloseDownMode.argtypes = [vp, i]; X.XCloseDisplay.argtypes = [vp]; X.XSync.argtypes = [vp, i]
+X.XQueryTree.argtypes = [vp, ul, C.POINTER(ul), C.POINTER(ul), C.POINTER(vp), C.POINTER(u)]
+E.XShapeCombineRectangles.argtypes = [vp, ul, i, i, i, vp, i, i, i]
+d = X.XOpenDisplay(None) or sys.exit("lowpaper: cannot open X display")
+x, y, w, h = map(int, sys.argv[2:6])
+win = X.XCreateSimpleWindow(d, X.XDefaultRootWindow(d), x, y, w, h, 0, 0, 0)
+atom = lambda n: X.XInternAtom(d, n.encode(), 0)
+def prop(name, typ, vals):
+    X.XChangeProperty(d, win, atom(name), typ, 32, 0, (C.c_long * len(vals))(*vals), len(vals))
+# a desktop-type window lives in the desktop layer; with BELOW, xfwm4 keeps it above the file manager's
+# desktop; without it ("under"), a desktop window mapped later (a restarted xfdesktop) goes on top of it
+under = sys.argv[6:] == ["under"]
+prop("_NET_WM_WINDOW_TYPE", 4, [atom("_NET_WM_WINDOW_TYPE_DESKTOP")])
+prop("_NET_WM_STATE", 4, [atom("_NET_WM_STATE_" + s) for s in ("BELOW", "STICKY", "SKIP_TASKBAR", "SKIP_PAGER")[under:]])
+prop("_NET_WM_DESKTOP", 6, [0xFFFFFFFF])
+prop("WM_HINTS", 35, [1, 0, 0, 0, 0, 0, 0, 0, 0])  # InputHint, input=False: never takes focus
+X.XStoreName(d, win, b"lowpaper")
+noinput = lambda: E.XShapeCombineRectangles(d, win, 2, 0, 0, None, 0, 0, 0)  # empty input shape
+noinput()
+X.XMapWindow(d, win)
+# the WM wraps us in a frame; setting the shape again makes it copy it there, so clicks reach the desktop
+r, p, c, n = ul(), ul(), vp(), u()
+for _ in range(40):
+    X.XSync(d, 0); X.XQueryTree(d, win, C.byref(r), C.byref(p), C.byref(c), C.byref(n))
+    if p.value != r.value: break
+    time.sleep(0.05)
+noinput(); X.XSync(d, 0)
+X.XSetCloseDownMode(d, 1)  # RetainPermanent: the window outlives this process; `xkill -id` removes it
+X.XCloseDisplay(d)
+print(hex(win))
+PY
+}
+
+# ---------- running instances ----------
+ipc() {  # ipc SOCKET JSON... -> one line of reply data per command
+  local sock=$1 req line i=0 c; local -a d; shift
+  for c; do req+=${req:+$'\n'}"{\"command\":$c,\"request_id\":$((i++))}"; done
+  [ -n "${NC+x}" ] || NC=$(nc -h 2>&1 | grep -q -- -U && echo 1)
+  while read -r line; do
+    [[ $line =~ \"data\":\"?(.*[^\"])?\"?,\"request_id\":([0-9]+) ]] && d[BASH_REMATCH[2]]=${BASH_REMATCH[1]}
+  done < <(if [ -n "$NC" ]; then echo "$req" | nc -N -U "$sock"; else py ipc "$sock" "$req"; fi 2>/dev/null)
+  for ((i = 0; i < $#; i++)); do echo "${d[i]:-}"; done
+}
+each() { [ -s "$STATE" ] && while read -r name pid wid sock; do "$@"; done < "$STATE"; }
+ipc_all() { _ipc() { ipc "$sock" "$1" >/dev/null; }; each _ipc "$1"; }
+first_get() { [ -s "$STATE" ] && ipc "$(awk 'NR==1{print $4}' "$STATE")" "[\"get_property\",\"$1\"]"; }
+
+stop() {  # stop [keep]: keep the windows (and STATE) for the next wallpaper
+  local w keep=${1:-}; w=$(cat "$RUN/watch.pid" 2>/dev/null) && [ "$w" != $$ ] && kill "$w" 2>/dev/null
+  _stop() {
+    [[ $(cat /proc/$pid/comm 2>/dev/null) == mpv* ]] && kill "$pid"
+    [ -n "$keep" ] || [ "$wid" = - ] || xkill -id "$wid" >/dev/null 2>&1
+    rm -f "$sock"
+  }
+  each _stop
+  rm -f "$RUN/paused" "$RUN/watch.pid"
+  [ -n "$keep" ] || { rm -f "$STATE"; backdrop_restore; }
+}
+
+poke() { local w; w=$(cat "$RUN/watch.pid" 2>/dev/null) && kill -USR1 "$w" 2>/dev/null; }  # watcher: re-check now
+# a manual resume wins until the next focus/window-state change
+pause()  { touch "$RUN/paused"; ipc_all '["set_property","pause",true]'; }
+resume() { rm -f "$RUN/paused"; ipc_all '["set_property","pause",false]'; }
+toggle() { if [ "$(first_get pause)" = true ]; then resume; else pause; fi; }
+
+status() {
+  [ -s "$STATE" ] || { echo "not running"; return 1; }
+  _st() {
+    local r; mapfile -t r < <(ipc "$sock" '["get_property","pause"]' '["get_property","path"]')
+    echo "$name  $([ "${r[0]:-}" = true ] && echo paused || echo playing)  ${r[1]:-?}"
+  }
+  each _st
+}
+
+# Pause while the focused window is fullscreen/maximized or the monitor is off; clean up if mpv dies.
+# Event driven: xprop -spy reports focus and window-state changes, so it costs nothing while idle.
+watch() {
+  local fifo=$RUN/watch.fifo last= s= a line root win= alive p off=0
+  echo $$ > "$RUN/watch.pid"
+  rm -f "$fifo"; mkfifo "$fifo"; exec 3<>"$fifo"; rm -f "$fifo"
+  trap 'last=' USR1
+  trap 'kill $root $win 2>/dev/null; exit' TERM EXIT
+  xprop -root -spy -notype _NET_ACTIVE_WINDOW >&3 2>/dev/null & root=$!
+  while :; do
+    if read -r -t 10 line <&3; then
+      case $line in
+        _NET_ACTIVE_WINDOW*)
+          a=${line#*# }; a=${a%%,*}; s=
+          [ -n "$win" ] && kill "$win" 2>/dev/null; win=
+          [[ $a == 0x* && $a != 0x0 ]] && { xprop -id "$a" -spy -notype _NET_WM_STATE >&3 2>/dev/null & win=$!; } ;;
+        _NET_WM_STATE*) s=$line ;;
+      esac
+    else  # timeout or USR1
+      alive=0; _alive() { kill -0 "$pid" 2>/dev/null && alive=1; }; each _alive
+      [ $alive = 1 ] || { stop; exit; }
+      off=0; xset q 2>/dev/null | grep -q 'Monitor is Off' && off=1
+    fi
+    [ -f "$CONF" ] && . "$CONF"
+    if [ "$AUTOPAUSE" != 1 ] || [ -e "$RUN/paused" ]; then last=; continue; fi
+    p=false; [ $off = 1 ] && p=true
+    [[ $s == *FULLSCREEN* || ($s == *MAXIMIZED_VERT* && $s == *MAXIMIZED_HORZ*) ]] && [[ $s != *HIDDEN* ]] && p=true
+    [ "$p" = "$last" ] || { ipc_all "[\"set_property\",\"pause\",$p]"; last=$p; }
+  done
+}
+
+# ---------- setting a wallpaper ----------
+monitors() {  # name w h x y
+  xrandr --listmonitors 2>/dev/null | awk 'NR>1{split($3,g,/[\/x+]/); print $NF, g[1], g[3], g[5], g[6]}'
+}
+
+has_desktop() {  # a file manager owns a desktop window (xfdesktop, caja, nemo...)
+  local w
+  for w in $(xprop -root _NET_CLIENT_LIST_STACKING 2>/dev/null | sed 's/.*#//; s/,/ /g' | awk '{for(i=1;i<=NF&&i<=3;i++)print $i}'); do
+    xprop -id "$w" _NET_WM_WINDOW_TYPE 2>/dev/null | grep -q _DESKTOP && return
+  done
+  return 1
+}
+
+# ---------- XFCE ----------
+xfce() { [[ ${XDG_CURRENT_DESKTOP:-} == *XFCE* ]] && have xfconf-query; }
+xfkeys() {  # backdrop property of every monitor/workspace: xfkeys image-style
+  local k; k=$(xfconf-query -c xfce4-desktop -l | grep "workspace[0-9]*/$1\$")
+  [ -n "$k" ] && echo "$k" || monitors | while read -r n _; do echo "/backdrop/screen0/monitor$n/workspace0/$1"; done
+}
+xfset() { xfconf-query -c xfce4-desktop -p "$1" -s "$2" 2>/dev/null || xfconf-query -c xfce4-desktop -p "$1" -n -t "$3" -s "$2"; }
+
+native_image() {  # XFCE shows a still image itself: zero resident cost
+  local k s; s=$(case $FIT in (fit) echo 4;; (stretch) echo 3;; (*) echo 5;; esac)
+  for k in $(xfkeys last-image); do xfset "$k" "$1" string; xfset "${k%last-image}image-style" "$s" int; done
+}
+
+# xfdesktop paints its icons on an opaque window. Restarted with an RGBA visual (a tiny LD_PRELOAD shim)
+# and a transparent backdrop, it shows the video window underneath and keeps the icons on top.
+icons_shim() {  # prints the shim path; fails where this can't work (no xfdesktop, no compositor, no gcc)
+  local so=${XDG_CACHE_HOME:-$HOME/.cache}/lowpaper/rgba.so
+  [ "$ICONS" = 1 ] && xfce && pgrep -x xfdesktop >/dev/null || return 1
+  [ "$(xfconf-query -c xfwm4 -p /general/use_compositing 2>/dev/null)" = true ] || return 1
+  [ -f "$so" ] || { have gcc && mkdir -p "${so%/*}" && gcc -shared -fPIC -O2 -o "$so" -x c - -ldl <<'C'; } || return 1
+#define _GNU_SOURCE
+#include <dlfcn.h>
+void *gdk_screen_get_rgba_visual(void *);
+void *gdk_screen_get_system_visual(void *s) {  /* GTK windows get the RGBA visual when there is one */
+    static void *(*real)(void *);
+    void *v = gdk_screen_get_rgba_visual(s);
+    if (v) return v;
+    if (!real) real = (void *(*)(void *))dlsym(RTLD_NEXT, "gdk_screen_get_system_visual");
+    return real(s);
+}
+C
+  echo "$so"
+}
+backdrop_clear() {  # transparent backdrop; the user's styles are saved once and restored by `lowpaper stop`
+  local k
+  [ -f "$CFG/backdrop" ] || xfconf-query -c xfce4-desktop -l -v | grep -E 'workspace[0-9]+/(color|image)-style ' > "$CFG/backdrop"
+  for k in $(xfkeys image-style); do xfset "$k" 0 int; xfset "${k%image-style}color-style" 3 int; done
+}
+backdrop_restore() {
+  local k v
+  [ -f "$CFG/backdrop" ] || return 0
+  while read -r k v; do xfconf-query -c xfce4-desktop -p "$k" -s "$v"; done < "$CFG/backdrop"
+  rm -f "$CFG/backdrop"
+}
+xfdesktop_over() {  # restart xfdesktop with the shim; mapped last, it lands above our windows
+  local p; p=$(pgrep -xo xfdesktop) && grep -qs "$1" "/proc/$p/maps" && [ "${2:-}" != new ] && return
+  xfdesktop --quit 2>/dev/null
+  for _ in $(seq 30); do pgrep -x xfdesktop >/dev/null || break; sleep 0.1; done
+  LD_PRELOAD=$1 setsid xfdesktop </dev/null >/dev/null 2>&1 &
+}
+
+fit_opts() {  # mpv properties for a fit mode; also applied live over IPC
+  case $1 in fill) echo 1.0 yes ;; fit) echo 0 yes ;; stretch) echo 0 no ;; *) return 1 ;; esac
+}
+
+hwdec_probe() {  # merely probing hwdec costs ~50MB RSS even when it fails, so test once and remember
+  if mpv --no-config --vo=null --aid=no --frames=15 --hwdec=auto-copy-safe --msg-level=all=no,vd=v "$1" 2>&1 \
+      | grep -q 'Using hardware decoding'; then conf_set HWDEC auto-safe; else conf_set HWDEC no; fi
+}
+
+frame_cache() {  # a short loop fits in RAM: decode it once, then replay the frames (mpv CPU -85%)
+  local d r w h fr
+  [ "$CACHE_MB" -gt 0 ] || return 1
+  read -r _ d r w h < <(mpv --no-config --vo=null --aid=no --frames=1 \
+    --term-playing-msg='wpprobe ${=duration} ${=container-fps} ${=width} ${=height}' "$1" 2>/dev/null | grep ^wpprobe)
+  [[ ${w:-} =~ ^[0-9]+$ ]] || return 1
+  fr=$(awk -v d="$d" -v r="$r" 'BEGIN{print int(d*r*1.1)+5}')  # unknown fps/duration -> 5 -> no cache
+  [ "$fr" -gt 5 ] && [ $((fr * w * h * 3 / 2 / 1048576)) -le "$CACHE_MB" ] || return 1
+  echo "--vf=lavfi=[loop=loop=-1:size=$fr]"
+}
+
+set_wallpaper() {  # [options] FILE|DIR...
+  local out= mpvonly=0 a f n abs=() fo
+  while [ $# -gt 0 ]; do case $1 in
+    -f|--fit) FIT=$2; shift 2 ;;
+    -i|--interval) INTERVAL=$2; shift 2 ;;
+    -s|--shuffle) SHUFFLE=1; shift ;;
+    -a|--audio) AUDIO=1; shift ;;
+    -o|--output) out=$2; shift 2 ;;
+    --mpv) mpvonly=1; shift ;;
+    --) shift; break ;;
+    -*) die "unknown option $1 (see: lowpaper help)" ;;
+    *) break ;;
+  esac; done
+  [ $# -gt 0 ] || die "need a file or folder"
+  have mpv || die "mpv is required"
+  fo=($(fit_opts "$FIT")) || die "--fit must be fill|fit|stretch"
+
+  : > "$LIST.new"
+  for a in "$@"; do
+    a=$(readlink -f -- "$a") || die "not found: $a"; abs+=("$a")
+    if [ -d "$a" ]; then
+      find "$a" -type f | sort | while read -r f; do is_media "$f" && echo "$f"; done >> "$LIST.new"
+    elif [ -f "$a" ]; then echo "$a" >> "$LIST.new"
+    else die "not found: $a"; fi
+  done
+  n=$(wc -l < "$LIST.new"); [ "$n" -gt 0 ] || die "no images or videos found"
+  mv "$LIST.new" "$LIST"; f=$(head -1 "$LIST")
+  # remember for `lowpaper restore` (autostart)
+  printf '%q ' -f "$FIT" -i "$INTERVAL" $([ $SHUFFLE = 1 ] && echo -s) $([ $AUDIO = 1 ] && echo -a) \
+    ${out:+-o "$out"} $([ $mpvonly = 1 ] && echo --mpv) -- "${abs[@]}" > "$CFG/last"
+
+  if [ "$n" = 1 ] && is_image "$f" && [ $mpvonly = 0 ] && [ -z "${WAYLAND_DISPLAY:-}" ] && xfce; then
+    stop; native_image "$f"
+    echo "Set as desktop image (shown by XFCE, nothing kept running): $f"; return
+  fi
+  stop keep
+
+  local opts=(--no-config --no-terminal --osc=no --osd-level=0 --load-scripts=no --ytdl=no
+    --input-default-bindings=no --input-vo-keyboard=no --cursor-autohide=always --stop-screensaver=no
+    --sid=no --profile=fast --framedrop=vo --cache=no --demuxer-max-bytes=4MiB --demuxer-max-back-bytes=0
+    --panscan="${fo[0]}" --keepaspect="${fo[1]}")
+  [ $AUDIO = 1 ] || opts+=(--aid=no)
+  [ $SHUFFLE = 1 ] && opts+=(--shuffle)
+  if [ "$n" -gt 1 ]; then opts+=(--loop-playlist=inf --image-display-duration="$INTERVAL"); set -- --playlist="$LIST"
+  else opts+=(--image-display-duration=inf); set -- "$f"; fi
+  if [ "$n" = 1 ] && [ $AUDIO = 0 ] && ! is_image "$f" && a=$(frame_cache "$f"); then
+    opts+=(--hwdec=no "$a")  # no --loop-file: looping the file would decode it again
+  else
+    [ -n "$HWDEC" ] || is_image "$f" || hwdec_probe "$f"
+    opts+=(--hwdec="${HWDEC:-no}"); [ "$n" = 1 ] && opts+=(--loop-file=inf)
+  fi
+
+  if [ -n "${WAYLAND_DISPLAY:-}" ]; then
+    have mpvpaper || die "Wayland needs mpvpaper (GNOME Wayland is unsupported; use the Hanabi extension)"
+    local sock=$RUN/wl.sock; : > "$STATE"
+    setsid mpvpaper -p -o "${opts[*]} --input-ipc-server=$sock" "${out:-ALL}" "${@/#--playlist=/}" </dev/null >/dev/null 2>&1 &
+    echo "${out:-ALL} $! - $sock" >> "$STATE"
+  else
+    [ -n "${DISPLAY:-}" ] || die "no graphical session (DISPLAY is empty)"
+    have python3 || die "X11 needs python3"
+    local name w h x y wid sock so new= ; local -A old
+    [ -s "$STATE" ] && while read -r name _ wid _; do old[$name]=$wid; done < "$STATE"
+    : > "$STATE"
+    so=$(icons_shim) && backdrop_clear
+    while read -r name w h x y; do
+      [ -z "$out" ] || [ "$out" = "$name" ] || continue
+      wid=${old[$name]:-}; unset "old[$name]"
+      [ -n "$wid" ] && xwininfo -id "$wid" >/dev/null 2>&1 \
+        || { wid=$(py win "$x" "$y" "$w" "$h" ${so:+under}) || die "could not create window"; new=new; }
+      sock=$RUN/$name.sock
+      setsid mpv "${opts[@]}" --vo=xv,gpu --wid="$wid" --input-ipc-server="$sock" "$@" </dev/null >/dev/null 2>&1 &
+      echo "$name $! $wid $sock" >> "$STATE"
+    done < <(monitors)
+    for wid in "${old[@]}"; do xkill -id "$wid" >/dev/null 2>&1; done
+    [ -s "$STATE" ] || die "monitor not found: ${out}"
+    [ -n "$so" ] && xfdesktop_over "$so" $new
+    setsid "$SELF" _watch </dev/null >/dev/null 2>&1 &
+  fi
+  echo "Wallpaper started ($n file(s)): $f"
+}
+
+set_fit() {  # change fit live and remember it
+  local fo; fo=($(fit_opts "$1")) || die "fit must be fill|fit|stretch"
+  conf_set FIT "$1"
+  ipc_all "[\"set_property\",\"panscan\",${fo[0]}]"; ipc_all "[\"set_property\",\"keepaspect\",$([ "${fo[1]}" = yes ] && echo true || echo false)]"
+  [ -f "$CFG/last" ] && sed -i "s/^-f [a-z]*/-f $1/" "$CFG/last"
+}
+
+restore() {  # used by autostart: wait for the desktop to come up, then re-apply the last wallpaper
+  [ -f "$CFG/last" ] || exit 0
+  [ -n "${WAYLAND_DISPLAY:-}" ] || for _ in $(seq 20); do has_desktop && break; sleep 1; done
+  eval "set_wallpaper $(cat "$CFG/last")"
+}
+
+startup() {
+  case ${1:-} in
+    on) mkdir -p "${AUTOSTART%/*}"
+        printf '[Desktop Entry]\nType=Application\nName=lowpaper\nExec=%s restore\nNoDisplay=true\nX-GNOME-Autostart-enabled=true\n' "$SELF" > "$AUTOSTART"
+        echo "autostart on (Sway/Hyprland: add \"exec $SELF restore\" to your config)" ;;
+    off) rm -f "$AUTOSTART"; echo "autostart off" ;;
+    *) [ -f "$AUTOSTART" ] && echo on || echo off ;;
+  esac
+}
+
+autopause() {
+  case ${1:-} in
+    on) conf_set AUTOPAUSE 1; poke ;;
+    off) conf_set AUTOPAUSE 0; [ -e "$RUN/paused" ] || ipc_all '["set_property","pause",false]' ;;
+  esac
+  echo "auto-pause $([ "$AUTOPAUSE" = 1 ] && echo on || echo off)"
+}
+
+usage() { cat <<EOF
+lowpaper - video/image wallpaper light enough for old hardware (rendered by mpv)
+  lowpaper                    show what is playing
+  lowpaper [options] FILE|DIR set the wallpaper; several files/folders = slideshow
+     -f fill|fit|stretch        scaling (default $FIT)
+     -i SECONDS                 image slideshow interval (default $INTERVAL)
+     -s                         shuffle
+     -a                         enable audio (default: muted, audio not decoded)
+     -o MONITOR                 only this monitor (see xrandr --listmonitors)
+     --mpv                      use mpv even for a single image (default on XFCE: the desktop shows it)
+  lowpaper pause|resume|toggle|next|stop|status|restore
+  lowpaper fit fill|fit|stretch   change scaling live
+  lowpaper autopause on|off       pause while a window is fullscreen/maximized (default on)
+  lowpaper startup on|off         start at login, restoring the last wallpaper
+EOF
+}
+
+case ${1:-} in
+  "") status ;;
+  stop|pause|resume|toggle|status|restore) "$1" ;;
+  next) ipc_all '["playlist-next"]' ;;
+  fit) set_fit "${2:-}" ;;
+  startup|autopause) "$1" "${2:-}" ;;
+  _watch) watch ;;
+  help|-h|--help) usage ;;
+  *) set_wallpaper "$@" ;;
+esac
