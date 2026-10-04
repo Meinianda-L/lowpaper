@@ -35,9 +35,12 @@
 
 ```sh
 sudo apt install mpv
-git clone https://github.com/Meinianda-L/lowpaper-live-wallpaper.git
-install -Dm755 lowpaper-live-wallpaper/lowpaper ~/.local/bin/lowpaper
+mkdir -p ~/.local/bin
+curl -Lo ~/.local/bin/lowpaper https://github.com/Meinianda-L/lowpaper-live-wallpaper/releases/latest/download/lowpaper
+chmod +x ~/.local/bin/lowpaper
 ```
+
+lowpaper is a single file, so that is the whole install. The same script handles X11 and Wayland. To remove it, run `lowpaper stop` and delete the file.
 
 ## Usage
 
