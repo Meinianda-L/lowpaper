@@ -498,6 +498,12 @@ set_wallpaper() {  # [options] FILE|DIR...
   [ $# -gt 0 ] || die "need a file or folder"
   have mpv || die "mpv is required"
   fo=($(fit_opts "$FIT")) || die "--fit must be fill|fit|stretch"
+  if [ -n "$out" ]; then  # check before stopping the current wallpaper or touching `last`
+    local names
+    if [ -n "${WAYLAND_DISPLAY:-}" ]; then local wl; wl=$(wl_helper) || exit 1; names=$("$wl" --list) || exit 1
+    else names=$(monitors | cut -d' ' -f1); fi
+    grep -qxF -- "$out" <<< "$names" || die "monitor not found: $out (available: $(echo $names))"
+  fi
 
   : > "$LIST.new"
   for a in "$@"; do
