@@ -3,7 +3,7 @@
 # mpv does all decoding and rendering; lowpaper only puts it under the desktop and controls it.
 # X11: a one-shot python helper creates a desktop-layer window and exits (nothing stays resident).
 #      On XFCE, xfdesktop is restarted with an alpha channel so its icons stay above the video.
-# Wayland: mpvpaper (libmpv + layer-shell).
+# Wayland: a small C helper (built once with gcc, no -dev packages) puts libmpv on a layer-shell background surface.
 set -u
 PATH=$HOME/.local/bin:$PATH
 SELF=$(readlink -f "$0")
@@ -95,7 +95,7 @@ first_get() { [ -s "$STATE" ] && ipc "$(awk 'NR==1{print $4}' "$STATE")" "[\"get
 stop() {  # stop [keep]: keep the windows (and STATE) for the next wallpaper
   local w keep=${1:-}; w=$(cat "$RUN/watch.pid" 2>/dev/null) && [ "$w" != $$ ] && kill "$w" 2>/dev/null
   _stop() {
-    [[ $(cat /proc/$pid/comm 2>/dev/null) == mpv* ]] && kill "$pid"
+    [[ $(cat /proc/$pid/comm 2>/dev/null) =~ ^(mpv|lowpaper-wl) ]] && kill "$pid"
     [ -n "$keep" ] || [ "$wid" = - ] || xkill -id "$wid" >/dev/null 2>&1
     rm -f "$sock"
   }
@@ -113,6 +113,7 @@ toggle() { if [ "$(first_get pause)" = true ]; then resume; else pause; fi; }
 status() {
   [ -s "$STATE" ] || { echo "not running"; return 1; }
   _st() {
+    kill -0 "$pid" 2>/dev/null || { echo "$name  stopped"; return; }
     local r; mapfile -t r < <(ipc "$sock" '["get_property","pause"]' '["get_property","path"]')
     echo "$name  $([ "${r[0]:-}" = true ] && echo paused || echo playing)  ${r[1]:-?}"
   }
@@ -214,6 +215,253 @@ xfdesktop_over() {  # restart xfdesktop with the shim; mapped last, it lands abo
   LD_PRELOAD=$1 setsid xfdesktop </dev/null >/dev/null 2>&1 &
 }
 
+# ---------- Wayland ----------
+wl_helper() {  # prints the helper path, building it on first use
+  local bin=${XDG_CACHE_HOME:-$HOME/.cache}/lowpaper/wl1/lowpaper-wl
+  [ -x "$bin" ] && { echo "$bin"; return; }
+  have gcc || die "Wayland needs gcc once, to build a small helper (sudo apt install gcc)"
+  mkdir -p "${bin%/*}"
+  gcc -O2 -o "$bin" -x c - -l:libwayland-client.so.0 -l:libwayland-egl.so.1 -l:libEGL.so.1 -l:libmpv.so.2 <<'C' \
+    || die "could not build the Wayland helper (needs libmpv2, libwayland-egl1, libegl1)"
+/* lowpaper-wl: libmpv on a wlr-layer-shell background surface.
+ * Builds with gcc alone: the few wayland/EGL/libmpv declarations it needs are written out here,
+ * so no -dev packages are required, only the runtime libraries every Wayland desktop with mpv has.
+ *   lowpaper-wl --list                          print output names
+ *   lowpaper-wl OUTPUT [--nopause] [--mpv-option=value]... FILE
+ * Hidden-wallpaper pause: the compositor stops sending frame callbacks to a surface nobody can see. */
+#include <poll.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+/* ---- wayland-client ---- */
+struct wl_proxy; struct wl_display;
+struct wl_message { const char *name, *signature; const struct wl_interface **types; };
+struct wl_interface { const char *name; int version, method_count; const struct wl_message *methods;
+                      int event_count; const struct wl_message *events; };
+extern const struct wl_interface wl_registry_interface, wl_compositor_interface, wl_surface_interface,
+  wl_region_interface, wl_output_interface, wl_callback_interface;
+struct wl_display *wl_display_connect(const char *);
+int wl_display_get_fd(struct wl_display *), wl_display_roundtrip(struct wl_display *),
+  wl_display_dispatch_pending(struct wl_display *), wl_display_flush(struct wl_display *),
+  wl_display_prepare_read(struct wl_display *), wl_display_read_events(struct wl_display *);
+void wl_display_cancel_read(struct wl_display *);
+struct wl_proxy *wl_proxy_marshal_constructor(struct wl_proxy *, uint32_t, const struct wl_interface *, ...);
+struct wl_proxy *wl_proxy_marshal_constructor_versioned(struct wl_proxy *, uint32_t, const struct wl_interface *, uint32_t, ...);
+void wl_proxy_marshal(struct wl_proxy *, uint32_t, ...);
+int wl_proxy_add_listener(struct wl_proxy *, void (**)(void), void *);
+void wl_proxy_destroy(struct wl_proxy *);
+struct wl_egl_window *wl_egl_window_create(struct wl_proxy *, int, int);
+void wl_egl_window_resize(struct wl_egl_window *, int, int, int, int);
+#define P(x) ((struct wl_proxy *)(x))
+#define LISTEN(obj, fns, data) wl_proxy_add_listener(P(obj), (void (**)(void))(fns), data)
+
+/* wlr-layer-shell-unstable-v1, only what a wallpaper needs */
+static const struct wl_interface zwlr_layer_surface_v1_interface;
+static const struct wl_interface *lt[] = { NULL, NULL, NULL, NULL,
+  &zwlr_layer_surface_v1_interface, &wl_surface_interface, &wl_output_interface, NULL, NULL };
+static const struct wl_message shell_req[] = { { "get_layer_surface", "no?ous", lt + 4 }, { "destroy", "3", lt } };
+static const struct wl_interface zwlr_layer_shell_v1_interface = { "zwlr_layer_shell_v1", 1, 2, shell_req, 0, NULL };
+static const struct wl_message surf_req[] = { { "set_size", "uu", lt }, { "set_anchor", "u", lt },
+  { "set_exclusive_zone", "i", lt }, { "set_margin", "iiii", lt }, { "set_keyboard_interactivity", "u", lt },
+  { "get_popup", "o", lt }, { "ack_configure", "u", lt }, { "destroy", "", lt } };
+static const struct wl_message surf_ev[] = { { "configure", "uuu", lt }, { "closed", "", lt } };
+static const struct wl_interface zwlr_layer_surface_v1_interface = { "zwlr_layer_surface_v1", 1, 8, surf_req, 2, surf_ev };
+
+/* ---- EGL ---- */
+typedef void *EGLDisplay, *EGLConfig, *EGLContext, *EGLSurface; typedef int32_t EGLint;
+EGLDisplay eglGetDisplay(void *);
+unsigned eglInitialize(EGLDisplay, EGLint *, EGLint *), eglBindAPI(unsigned),
+  eglChooseConfig(EGLDisplay, const EGLint *, EGLConfig *, EGLint, EGLint *),
+  eglMakeCurrent(EGLDisplay, EGLSurface, EGLSurface, EGLContext), eglSwapBuffers(EGLDisplay, EGLSurface),
+  eglSwapInterval(EGLDisplay, EGLint);
+EGLContext eglCreateContext(EGLDisplay, EGLConfig, EGLContext, const EGLint *);
+EGLSurface eglCreateWindowSurface(EGLDisplay, EGLConfig, void *, const EGLint *);
+void *eglGetProcAddress(const char *);
+
+/* ---- libmpv (client API 2) ---- */
+typedef struct mpv_handle mpv_handle; typedef struct mpv_render_context mpv_render_context;
+typedef struct { int event_id, error; uint64_t reply_userdata; void *data; } mpv_event;
+typedef struct { int type; void *data; } mpv_render_param;
+typedef struct { void *(*get_proc_address)(void *, const char *); void *ctx; } mpv_opengl_init_params;
+typedef struct { int fbo, w, h, internal_format; } mpv_opengl_fbo;
+mpv_handle *mpv_create(void);
+int mpv_set_option_string(mpv_handle *, const char *, const char *), mpv_initialize(mpv_handle *),
+  mpv_command(mpv_handle *, const char **), mpv_set_property_string(mpv_handle *, const char *, const char *);
+const char *mpv_error_string(int);
+mpv_event *mpv_wait_event(mpv_handle *, double);
+void mpv_set_wakeup_callback(mpv_handle *, void (*)(void *), void *);
+int mpv_render_context_create(mpv_render_context **, mpv_handle *, mpv_render_param *),
+  mpv_render_context_render(mpv_render_context *, mpv_render_param *);
+void mpv_render_context_set_update_callback(mpv_render_context *, void (*)(void *), void *),
+  mpv_render_context_report_swap(mpv_render_context *);
+uint64_t mpv_render_context_update(mpv_render_context *);
+
+/* ---- state ---- */
+#define MAXOUT 16
+static struct { struct wl_proxy *p; char name[64]; int scale; } out[MAXOUT];
+static int nout, wakefd[2], width, height, scale = 1, configured, dirty, autopaused, nopause, hwdec;
+static struct wl_display *dpy;
+static struct wl_proxy *compositor, *shell, *surface, *callback;
+static struct wl_egl_window *ewin;
+static EGLDisplay edpy; static EGLSurface esurf;
+static mpv_handle *mpv; static mpv_render_context *rctx;
+static double cb_since;  /* when the pending frame callback was requested */
+
+static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
+static void die(const char *m) { fprintf(stderr, "lowpaper-wl: %s\n", m); exit(1); }
+
+static void o_geometry(void *d, struct wl_proxy *o, int x, int y, int pw, int ph, int sp, const char *mk, const char *md, int t) {}
+static void o_mode(void *d, struct wl_proxy *o, uint32_t f, int w, int h, int r) {}
+static void o_done(void *d, struct wl_proxy *o) {}
+static void o_scale(void *d, struct wl_proxy *o, int s) { out[(intptr_t)d].scale = s; }
+static void o_name(void *d, struct wl_proxy *o, const char *n) { snprintf(out[(intptr_t)d].name, 64, "%s", n); }
+static void o_desc(void *d, struct wl_proxy *o, const char *n) {}
+static void (*out_l[])() = { (void (*)())o_geometry, (void (*)())o_mode, (void (*)())o_done, (void (*)())o_scale,
+                             (void (*)())o_name, (void (*)())o_desc };
+
+static void g_add(void *d, struct wl_proxy *reg, uint32_t id, const char *iface, uint32_t ver) {
+  const struct wl_interface *i = NULL; uint32_t v = 1;
+  if (!strcmp(iface, "wl_compositor")) i = &wl_compositor_interface, v = ver < 4 ? ver : 4;
+  else if (!strcmp(iface, "zwlr_layer_shell_v1")) i = &zwlr_layer_shell_v1_interface;
+  else if (!strcmp(iface, "wl_output") && nout < MAXOUT) i = &wl_output_interface, v = ver < 4 ? ver : 4;
+  if (!i) return;
+  struct wl_proxy *p = wl_proxy_marshal_constructor_versioned(reg, 0, i, v, id, i->name, v, NULL);
+  if (i == &wl_compositor_interface) compositor = p;
+  else if (i == &zwlr_layer_shell_v1_interface) shell = p;
+  else { out[nout].p = p; out[nout].scale = 1; snprintf(out[nout].name, 64, "%d", nout);
+         LISTEN(p, out_l, (void *)(intptr_t)nout); nout++; }
+}
+static void g_remove(void *d, struct wl_proxy *reg, uint32_t id) {}
+static void (*reg_l[])() = { (void (*)())g_add, (void (*)())g_remove };
+
+static void l_configure(void *d, struct wl_proxy *ls, uint32_t serial, uint32_t w, uint32_t h) {
+  wl_proxy_marshal(ls, 6, serial);  /* ack_configure */
+  width = w; height = h; configured = dirty = 1;
+  if (ewin) wl_egl_window_resize(ewin, w * scale, h * scale, 0, 0);
+}
+static void l_closed(void *d, struct wl_proxy *ls) { exit(0); }
+static void (*layer_l[])() = { (void (*)())l_configure, (void (*)())l_closed };
+
+static void paused_by_us(int on) {
+  autopaused = on; mpv_set_property_string(mpv, "pause", on ? "yes" : "no");
+}
+static void f_done(void *d, struct wl_proxy *cb, uint32_t t) {
+  wl_proxy_destroy(cb); callback = NULL;
+  if (autopaused) paused_by_us(0);  /* seen again */
+}
+static void (*frame_l[])() = { (void (*)())f_done };
+
+static void wake(void *d) { char c = 0; (void)!write(wakefd[1], &c, 1); }
+static void *gpa(void *c, const char *n) { return eglGetProcAddress(n); }
+
+static void draw(void) {
+  mpv_opengl_fbo fbo = { 0, width * scale, height * scale, 0 }; int flip = 1;
+  mpv_render_param p[] = { { 3, &fbo }, { 4, &flip }, { 0, NULL } };
+  mpv_render_context_render(rctx, p);
+  callback = wl_proxy_marshal_constructor(surface, 3, &wl_callback_interface, NULL);  /* frame */
+  LISTEN(callback, frame_l, NULL); cb_since = now();
+  eglSwapBuffers(edpy, esurf);  /* commits the surface */
+  mpv_render_context_report_swap(rctx);
+  dirty = 0;
+}
+
+int main(int argc, char **argv) {
+  if (argc < 2) die("usage: lowpaper-wl --list | OUTPUT [--nopause] [--opt=value]... FILE");
+  if (!(dpy = wl_display_connect(NULL))) die("cannot connect to the Wayland display");
+  struct wl_proxy *reg = wl_proxy_marshal_constructor(P(dpy), 1, &wl_registry_interface, NULL);
+  LISTEN(reg, reg_l, NULL);
+  wl_display_roundtrip(dpy); wl_display_roundtrip(dpy);  /* globals, then output names */
+  if (!strcmp(argv[1], "--list")) { for (int i = 0; i < nout; i++) puts(out[i].name); return 0; }
+  if (!compositor) die("no wl_compositor");
+  if (!shell) die("this compositor has no wlr-layer-shell (GNOME: use the Hanabi extension)");
+  int o = -1; for (int i = 0; i < nout; i++) if (!strcmp(out[i].name, argv[1])) o = i;
+  if (o < 0) die("output not found");
+  scale = out[o].scale;
+
+  /* mpv: lowpaper passes the same --options it gives the mpv binary on X11 */
+  if (!(mpv = mpv_create())) die("mpv_create failed");
+  mpv_set_option_string(mpv, "vo", "libmpv");
+  const char *file = NULL, *list = NULL;
+  for (int i = 2; i < argc; i++) {
+    char *a = argv[i], k[256], *eq;
+    if (!strcmp(a, "--nopause")) { nopause = 1; continue; }
+    if (strncmp(a, "--", 2)) { file = a; continue; }
+    if (!strncmp(a, "--playlist=", 11)) { list = a + 11; continue; }
+    snprintf(k, sizeof k, "%s", a + 2); eq = strchr(k, '=');
+    const char *v = "yes"; if (eq) *eq = 0, v = eq + 1;
+    else if (!strncmp(k, "no-", 3)) memmove(k, k + 3, strlen(k + 3) + 1), v = "no";
+    if (!strcmp(k, "config")) continue;  /* libmpv never reads mpv.conf */
+    if (!strcmp(k, "hwdec")) hwdec = strcmp(v, "no") != 0;
+    int e = mpv_set_option_string(mpv, k, v);
+    if (e < 0) fprintf(stderr, "lowpaper-wl: --%s: %s\n", k, mpv_error_string(e));
+  }
+  if (!file && !list) die("need a file");
+  /* without hwdec, skip the GPU interop probe: it costs RAM, and some old libva builds crash in it */
+  if (!hwdec) mpv_set_option_string(mpv, "gpu-hwdec-interop", "no");
+  if (mpv_initialize(mpv) < 0) die("mpv_initialize failed");
+
+  surface = wl_proxy_marshal_constructor(compositor, 0, &wl_surface_interface, NULL);
+  struct wl_proxy *ls = wl_proxy_marshal_constructor(shell, 0, &zwlr_layer_surface_v1_interface,
+                                                     NULL, surface, out[o].p, 0, "wallpaper");  /* layer 0: background */
+  LISTEN(ls, layer_l, NULL);
+  wl_proxy_marshal(ls, 1, 15);   /* anchor all four edges */
+  wl_proxy_marshal(ls, 2, -1);   /* exclusive zone -1: cover the whole output, under panels */
+  wl_proxy_marshal(ls, 0, 0, 0); /* size 0x0: the compositor picks the output size */
+  struct wl_proxy *empty = wl_proxy_marshal_constructor(compositor, 1, &wl_region_interface, NULL);
+  wl_proxy_marshal(surface, 5, empty); wl_proxy_destroy(empty);  /* clicks go through */
+  if (scale > 1) wl_proxy_marshal(surface, 8, scale);
+  wl_proxy_marshal(surface, 6);  /* commit, then wait for the size */
+  while (!configured) if (wl_display_roundtrip(dpy) < 0) die("compositor went away");
+
+  EGLint n, cfg_attr[] = { 0x3033, 4, 0x3024, 8, 0x3023, 8, 0x3022, 8, 0x3040, 8, 0x3038 };  /* window, RGB888, desktop GL */
+  EGLint es_attr[] = { 0x3033, 4, 0x3024, 8, 0x3023, 8, 0x3022, 8, 0x3040, 4, 0x3038 };       /* fallback: GLES2 */
+  EGLint es_ctx[] = { 0x3098, 2, 0x3038 };
+  EGLConfig cfg; EGLContext ctx = NULL;
+  edpy = eglGetDisplay(dpy);
+  if (!edpy || !eglInitialize(edpy, NULL, NULL)) die("EGL init failed");
+  if (eglBindAPI(0x30A2) && eglChooseConfig(edpy, cfg_attr, &cfg, 1, &n) && n) ctx = eglCreateContext(edpy, cfg, NULL, NULL);
+  if (!ctx && eglBindAPI(0x30A0) && eglChooseConfig(edpy, es_attr, &cfg, 1, &n) && n) ctx = eglCreateContext(edpy, cfg, NULL, es_ctx);
+  if (!ctx) die("no usable OpenGL context");
+  ewin = wl_egl_window_create(surface, width * scale, height * scale);
+  esurf = eglCreateWindowSurface(edpy, cfg, ewin, NULL);
+  if (!esurf || !eglMakeCurrent(edpy, esurf, esurf, ctx)) die("EGL surface failed");
+  eglSwapInterval(edpy, 0);  /* pacing comes from frame callbacks, never block in swap */
+
+  mpv_opengl_init_params gl = { gpa, NULL };
+  mpv_render_param rp[] = { { 1, "opengl" }, { 2, &gl }, { hwdec ? 9 : 0, dpy }, { 0, NULL } };  /* 9: WL_DISPLAY, for hwdec */
+  if (mpv_render_context_create(&rctx, mpv, rp) < 0) die("mpv render context failed");
+  if (pipe(wakefd)) die("pipe");
+  mpv_set_wakeup_callback(mpv, wake, NULL);
+  mpv_render_context_set_update_callback(rctx, wake, NULL);
+  const char *cmd[] = { list ? "loadlist" : "loadfile", list ? list : file, NULL };
+  mpv_command(mpv, cmd);
+
+  struct pollfd pf[2] = { { wl_display_get_fd(dpy), POLLIN, 0 }, { wakefd[0], POLLIN, 0 } };
+  for (;;) {
+    while (wl_display_prepare_read(dpy)) wl_display_dispatch_pending(dpy);
+    wl_display_flush(dpy);
+    poll(pf, 2, callback ? 500 : -1);
+    if (pf[0].revents & POLLIN) { if (wl_display_read_events(dpy) < 0) return 0; }
+    else wl_display_cancel_read(dpy);
+    if (pf[0].revents & (POLLERR | POLLHUP)) return 0;
+    wl_display_dispatch_pending(dpy);
+    if (pf[1].revents & POLLIN) { char b[64]; (void)!read(wakefd[0], b, sizeof b); }
+    for (mpv_event *e; (e = mpv_wait_event(mpv, 0))->event_id;)
+      if (e->event_id == 1) return 0;  /* shutdown: `quit` over IPC */
+    if (mpv_render_context_update(rctx) & 1) dirty = 1;
+    /* a frame callback that never comes means the surface is hidden: stop decoding until it does */
+    if (callback && !autopaused && !nopause && now() - cb_since > 1.0) paused_by_us(1);
+    if (dirty && !callback) draw();
+  }
+}
+C
+  echo "$bin"
+}
+
 fit_opts() {  # mpv properties for a fit mode; also applied live over IPC
   case $1 in fill) echo 1.0 yes ;; fit) echo 0 yes ;; stretch) echo 0 no ;; *) return 1 ;; esac
 }
@@ -287,10 +535,16 @@ set_wallpaper() {  # [options] FILE|DIR...
   fi
 
   if [ -n "${WAYLAND_DISPLAY:-}" ]; then
-    have mpvpaper || die "Wayland needs mpvpaper (GNOME Wayland is unsupported; use the Hanabi extension)"
-    local sock=$RUN/wl.sock; : > "$STATE"
-    setsid mpvpaper -p -o "${opts[*]} --input-ipc-server=$sock" "${out:-ALL}" "${@/#--playlist=/}" </dev/null >/dev/null 2>&1 &
-    echo "${out:-ALL} $! - $sock" >> "$STATE"
+    local wl name; wl=$(wl_helper) || exit 1
+    local outs; outs=$("$wl" --list) || exit 1
+    : > "$STATE"
+    for name in $outs; do
+      [ -z "$out" ] || [ "$out" = "$name" ] || continue
+      setsid "$wl" "$name" $([ "$AUTOPAUSE" = 1 ] || echo --nopause) "${opts[@]}" --input-ipc-server="$RUN/$name.sock" "$@" \
+        </dev/null >/dev/null 2>&1 &
+      echo "$name $! - $RUN/$name.sock" >> "$STATE"
+    done
+    [ -s "$STATE" ] || die "output not found: ${out} (outputs: $(echo $outs))"
   else
     [ -n "${DISPLAY:-}" ] || die "no graphical session (DISPLAY is empty)"
     have python3 || die "X11 needs python3"
