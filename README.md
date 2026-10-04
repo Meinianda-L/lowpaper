@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/lowpaper-lowplay.svg" width="112" alt="lowpaper icon">
+</p>
+
 <h1 align="center">lowpaper</h1>
 
 <p align="center">
