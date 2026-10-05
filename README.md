@@ -36,7 +36,7 @@
 ```sh
 sudo apt install mpv
 mkdir -p ~/.local/bin
-curl -Lo ~/.local/bin/lowpaper https://github.com/Meinianda-L/lowpaper-live-wallpaper/releases/latest/download/lowpaper
+curl -Lo ~/.local/bin/lowpaper https://github.com/Meinianda-L/lowpaper/releases/latest/download/lowpaper
 chmod +x ~/.local/bin/lowpaper
 ```
 
