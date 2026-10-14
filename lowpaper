@@ -11,7 +11,8 @@ CFG=${XDG_CONFIG_HOME:-$HOME/.config}/lowpaper
 RUN=${XDG_RUNTIME_DIR:-/tmp}/lowpaper-$(id -u)
 CONF=$CFG/config STATE=$RUN/state LIST=$RUN/playlist.m3u AUTOSTART=$HOME/.config/autostart/lowpaper.desktop
 mkdir -p "$CFG" "$RUN"
-FIT=fill INTERVAL=300 SHUFFLE=0 AUDIO=0 AUTOPAUSE=1 HWDEC= CACHE_MB=256 ICONS=1
+FIT=fill INTERVAL=300 SHUFFLE=0 AUDIO=0 AUTOPAUSE=1 HWDEC='' CACHE_MB=256 ICONS=1
+# shellcheck source=/dev/null
 [ -f "$CONF" ] && . "$CONF"
 
 VERSION=0.1.1
@@ -114,7 +115,7 @@ toggle() { if [ "$(first_get pause)" = true ]; then resume; else pause; fi; }
 status() {
   [ -s "$STATE" ] || { echo "not running"; return 1; }
   _st() {
-    kill -0 "$pid" 2>/dev/null || { echo "$name  stopped"; return; }
+    kill -0 "$pid" 2>/dev/null || { echo "$name  stopped (see $RUN/$name.log)"; return; }
     local r; mapfile -t r < <(ipc "$sock" '["get_property","pause"]' '["get_property","path"]')
     echo "$name  $([ "${r[0]:-}" = true ] && echo paused || echo playing)  ${r[1]:-?}"
   }
@@ -125,7 +126,7 @@ status() {
 # lay the wallpaper out again when a monitor is added, removed or resized.
 # Event driven: xprop -spy and xev report changes, so it costs nothing while idle.
 watch() {
-  local fifo=$RUN/watch.fifo last= s= a line root win= rr= alive p off=0
+  local fifo=$RUN/watch.fifo last='' s='' a line root win='' rr='' alive p off=0
   echo $$ > "$RUN/watch.pid"
   rm -f "$fifo"; mkfifo "$fifo"; exec 3<>"$fifo"; rm -f "$fifo"
   trap 'last=' USR1
@@ -149,6 +150,7 @@ watch() {
       [ $alive = 1 ] || { stop; exit; }
       off=0; xset q 2>/dev/null | grep -q 'Monitor is Off' && off=1
     fi
+    # shellcheck source=/dev/null
     [ -f "$CONF" ] && . "$CONF"
     if [ "$AUTOPAUSE" != 1 ] || [ -e "$RUN/paused" ]; then last=; continue; fi
     p=false; [ $off = 1 ] && p=true
@@ -285,11 +287,11 @@ EGLContext eglCreateContext(EGLDisplay, EGLConfig, EGLContext, const EGLint *);
 EGLSurface eglCreateWindowSurface(EGLDisplay, EGLConfig, void *, const EGLint *);
 void *eglGetProcAddress(const char *);
 
-/* ---- libmpv (client API 2) ---- */
+/* ---- libmpv (client API 1 or 2) ---- */
 typedef struct mpv_handle mpv_handle; typedef struct mpv_render_context mpv_render_context;
 typedef struct { int event_id, error; uint64_t reply_userdata; void *data; } mpv_event;
 typedef struct { int type; void *data; } mpv_render_param;
-typedef struct { void *(*get_proc_address)(void *, const char *); void *ctx; } mpv_opengl_init_params;
+typedef struct { void *(*get_proc_address)(void *, const char *); void *ctx; const char *extra_exts; } mpv_opengl_init_params;  /* extra_exts: API 1 only */
 typedef struct { int fbo, w, h, internal_format; } mpv_opengl_fbo;
 mpv_handle *mpv_create(void);
 int mpv_set_option_string(mpv_handle *, const char *, const char *), mpv_initialize(mpv_handle *),
@@ -446,7 +448,7 @@ int main(int argc, char **argv) {
   if (!esurf || !eglMakeCurrent(edpy, esurf, esurf, ctx)) die("EGL surface failed");
   eglSwapInterval(edpy, 0);  /* pacing comes from frame callbacks, never block in swap */
 
-  mpv_opengl_init_params gl = { gpa, NULL };
+  mpv_opengl_init_params gl = { gpa, NULL, NULL };
   mpv_render_param rp[] = { { 1, "opengl" }, { 2, &gl }, { hwdec ? 9 : 0, dpy }, { 0, NULL } };  /* 9: WL_DISPLAY, for hwdec */
   if (mpv_render_context_create(&rctx, mpv, rp) < 0) die("mpv render context failed");
   if (pipe(wakefd)) die("pipe");
@@ -478,8 +480,11 @@ C
   [ -x "$bin" ] && { echo "$bin"; return; }
   have gcc || die "Wayland needs gcc once, to build a small helper (sudo apt install gcc)"
   rm -rf "$dir"/wl[0-9-]*; mkdir -p "${bin%/*}"
-  gcc -O2 -o "$bin" -x c - -l:libwayland-client.so.0 -l:libwayland-egl.so.1 -l:libEGL.so.1 -l:libmpv.so.2 <<< "$src" \
-    || die "could not build the Wayland helper (needs libmpv2, libwayland-egl1, libegl1)"
+  local m; for m in 2 1 ''; do  # libmpv.so.2 (mpv >= 0.35), .so.1 on older distros
+    [ -n "$m" ] || die "could not build the Wayland helper (needs libmpv2 or libmpv1, libwayland-egl1, libegl1; see $dir/build.log)"
+    gcc -O2 -o "$bin" -x c - -l:libwayland-client.so.0 -l:libwayland-egl.so.1 -l:libEGL.so.1 -l:libmpv.so.$m \
+      <<< "$src" 2>"$dir/build.log" && break
+  done
   echo "$bin"
 }
 
@@ -504,7 +509,7 @@ frame_cache() {  # a short loop fits in RAM: decode it once, then replay the fra
 }
 
 set_wallpaper() {  # [options] FILE|DIR...
-  local out= mpvonly=0 a f n abs=() fo
+  local out='' mpvonly=0 a f n abs=() fo fit last
   while [ $# -gt 0 ]; do case $1 in
     -f|--fit) FIT=$2; shift 2 ;;
     -i|--interval) INTERVAL=$2; shift 2 ;;
@@ -518,7 +523,7 @@ set_wallpaper() {  # [options] FILE|DIR...
   esac; done
   [ $# -gt 0 ] || die "need a file or folder"
   have mpv || die "mpv is required"
-  fo=($(fit_opts "$FIT")) || die "--fit must be fill|fit|stretch"
+  fit=$(fit_opts "$FIT") || die "--fit must be fill|fit|stretch"; read -r -a fo <<< "$fit"
   if [ -n "$out" ]; then  # check before stopping the current wallpaper or touching `last`
     local names
     if [ -n "${WAYLAND_DISPLAY:-}" ]; then local wl; wl=$(wl_helper) || exit 1; names=$("$wl" --list) || exit 1
@@ -537,8 +542,9 @@ set_wallpaper() {  # [options] FILE|DIR...
   n=$(wc -l < "$LIST.new"); [ "$n" -gt 0 ] || die "no images or videos found"
   mv "$LIST.new" "$LIST"; f=$(head -1 "$LIST")
   # remember for `lowpaper restore` (autostart)
-  printf '%q ' -f "$FIT" -i "$INTERVAL" $([ $SHUFFLE = 1 ] && echo -s) $([ $AUDIO = 1 ] && echo -a) \
-    ${out:+-o "$out"} $([ $mpvonly = 1 ] && echo --mpv) -- "${abs[@]}" > "$CFG/last"
+  last=(-f "$FIT" -i "$INTERVAL"); [ "$SHUFFLE" = 1 ] && last+=(-s); [ "$AUDIO" = 1 ] && last+=(-a)
+  [ -n "$out" ] && last+=(-o "$out"); [ $mpvonly = 1 ] && last+=(--mpv)
+  printf '%q ' "${last[@]}" -- "${abs[@]}" > "$CFG/last"
 
   if [ "$n" = 1 ] && is_image "$f" && [ $mpvonly = 0 ] && [ -z "${WAYLAND_DISPLAY:-}" ] && xfce; then
     stop; native_image "$f"
@@ -546,7 +552,7 @@ set_wallpaper() {  # [options] FILE|DIR...
   fi
   stop keep
 
-  local opts=(--no-config --no-terminal --osc=no --osd-level=0 --load-scripts=no --ytdl=no
+  local opts=(--no-config --terminal=yes --input-terminal=no --msg-level=all=warn --msg-color=no --term-osd=no --osc=no --osd-level=0 --load-scripts=no --ytdl=no
     --input-default-bindings=no --input-vo-keyboard=no --cursor-autohide=always --stop-screensaver=no
     --sid=no --profile=fast --framedrop=vo --cache=no --demuxer-max-bytes=4MiB --demuxer-max-back-bytes=0
     --panscan="${fo[0]}" --keepaspect="${fo[1]}")
@@ -563,12 +569,13 @@ set_wallpaper() {  # [options] FILE|DIR...
 
   if [ -n "${WAYLAND_DISPLAY:-}" ]; then
     local wl name; wl=$(wl_helper) || exit 1
-    local outs lead=--restore-with=$SELF; outs=$("$wl" --list) || exit 1
+    local outs lead=--restore-with=$SELF np=''; outs=$("$wl" --list) || exit 1
+    [ "$AUTOPAUSE" = 1 ] || np=--nopause
     : > "$STATE"
     for name in $outs; do
       [ -z "$out" ] || [ "$out" = "$name" ] || continue
-      setsid "$wl" "$name" $([ "$AUTOPAUSE" = 1 ] || echo --nopause) ${lead:+"$lead"} "${opts[@]}" \
-        --input-ipc-server="$RUN/$name.sock" "$@" </dev/null >/dev/null 2>&1 &
+      setsid "$wl" "$name" ${np:+"$np"} ${lead:+"$lead"} "${opts[@]}" \
+        --input-ipc-server="$RUN/$name.sock" "$@" </dev/null >"$RUN/$name.log" 2>&1 &
       lead=  # one helper is enough to notice a monitor change
       echo "$name $! - $RUN/$name.sock" >> "$STATE"
     done
@@ -586,7 +593,7 @@ set_wallpaper() {  # [options] FILE|DIR...
       [ -n "$wid" ] && xwininfo -id "$wid" >/dev/null 2>&1 \
         || { wid=$(py win "$x" "$y" "$w" "$h" ${so:+under}) || die "could not create window"; new=new; }
       sock=$RUN/$name.sock
-      setsid mpv "${opts[@]}" --vo=xv,gpu --wid="$wid" --input-ipc-server="$sock" "$@" </dev/null >/dev/null 2>&1 &
+      setsid mpv "${opts[@]}" --vo=xv,gpu --wid="$wid" --input-ipc-server="$sock" "$@" </dev/null >"$RUN/$name.log" 2>&1 &
       echo "$name $! $wid $sock" >> "$STATE"
     done < <(monitors)
     for wid in "${old[@]}"; do xkill -id "$wid" >/dev/null 2>&1; done
@@ -598,7 +605,7 @@ set_wallpaper() {  # [options] FILE|DIR...
 }
 
 set_fit() {  # change fit live and remember it
-  local fo; fo=($(fit_opts "$1")) || die "fit must be fill|fit|stretch"
+  local fit fo; fit=$(fit_opts "$1") || die "fit must be fill|fit|stretch"; read -r -a fo <<< "$fit"
   conf_set FIT "$1"
   ipc_all "[\"set_property\",\"panscan\",${fo[0]}]"; ipc_all "[\"set_property\",\"keepaspect\",$([ "${fo[1]}" = yes ] && echo true || echo false)]"
   [ -f "$CFG/last" ] && sed -i "s/^-f [a-z]*/-f $1/" "$CFG/last"

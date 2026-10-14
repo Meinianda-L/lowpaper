@@ -35,5 +35,5 @@ check "remaining monitor still plays" grep -q '^HEADLESS-1  playing' <<< "$(st)"
 "$L" stop; sleep 1
 check "stop ends the helper" not pgrep -x lowpaper-wl
 kill "$sway"
-[ $fail = 0 ] || { echo "--- sway log"; tail -20 "$T/sway.log"; }
+[ $fail = 0 ] || { tail -n 20 "$T/sway.log" "$XDG_RUNTIME_DIR"/lowpaper-*/*.log "$XDG_CACHE_HOME"/lowpaper/build.log 2>/dev/null; }
 exit $fail

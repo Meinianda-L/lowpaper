@@ -15,7 +15,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y mpv sway ffmpeg libegl-mesa0 libgl1-mesa-dri
+      - run: sudo apt-get update && sudo apt-get install -y mpv libmpv2 sway ffmpeg libegl-mesa0 libgl1-mesa-dri
+      - run: ls -l /usr/lib/x86_64-linux-gnu/libmpv* || true
       - run: bash tests/wayland.sh
 
   x11:
