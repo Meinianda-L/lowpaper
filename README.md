@@ -33,14 +33,23 @@
 
 ## Install
 
+Install mpv with your package manager:
+
 ```sh
-sudo apt install mpv
+sudo apt install mpv       # Debian, Ubuntu, Mint
+sudo pacman -S mpv         # Arch
+sudo dnf install mpv       # Fedora (if dnf cannot find it, enable RPM Fusion)
+```
+
+Then download lowpaper:
+
+```sh
 mkdir -p ~/.local/bin
 curl -Lo ~/.local/bin/lowpaper https://github.com/Meinianda-L/lowpaper/releases/latest/download/lowpaper
 chmod +x ~/.local/bin/lowpaper
 ```
 
-lowpaper is a single file, so that is the whole install. The same script handles X11 and Wayland. To remove it, run `lowpaper stop` and delete the file.
+lowpaper is a single file, so that is the whole install. The same script handles X11 and Wayland. `lowpaper update` replaces it with the latest release. To remove it, run `lowpaper stop` and delete the file.
 
 ## Usage
 
@@ -55,6 +64,8 @@ lowpaper pause | resume | toggle | next | stop | status | restore
 lowpaper fit fill|fit|stretch     # change scaling live
 lowpaper autopause on|off         # pause while the wallpaper is covered (default on)
 lowpaper startup on|off           # start at login, restoring the last wallpaper
+lowpaper update                   # install the latest release
+lowpaper version
 ```
 
 Settings live in `~/.config/lowpaper/config` (`FIT`, `INTERVAL`, `AUTOPAUSE`, `CACHE_MB`, `ICONS`, `HWDEC`).
@@ -64,8 +75,8 @@ Settings live in `~/.config/lowpaper/config` (`FIT`, `INTERVAL`, `AUTOPAUSE`, `C
 | Environment | Needs |
 |---|---|
 | all | mpv |
-| X11 desktop with a desktop window (XFCE, MATE, Cinnamon, ...) | python3, xprop, xrandr, xkill (preinstalled on Debian, Ubuntu, Mint) |
-| Wayland with layer-shell (Sway, Hyprland, KDE, ...) | gcc, used once to build a 30 KB helper |
+| X11 desktop with a desktop window (XFCE, MATE, Cinnamon, ...) | python3, xprop, xrandr, xkill, xev (preinstalled on Debian, Ubuntu, Mint; on Arch: `python xorg-xprop xorg-xrandr xorg-xkill xorg-xev`) |
+| Wayland with layer-shell (Sway, Hyprland, KDE, ...) | gcc, used once to build a 30 KB helper, and libmpv (Debian/Ubuntu: `libmpv2`, Fedora: `mpv-libs`, included in Arch's `mpv`) |
 
 Optional: `gcc` also keeps XFCE desktop icons above the video. OpenBSD `nc` (default on Debian and Ubuntu) is used for mpv IPC, about 3 ms per call; without it lowpaper falls back to python, which is much slower on old CPUs.
 
@@ -73,9 +84,9 @@ GNOME on Wayland has no layer-shell; use the Hanabi extension there. Bare window
 
 ## How it works
 
-**X11.** A one-shot python call creates a desktop-type window and exits. mpv draws into it with `--wid`, using Xv where available, which is the cheapest path on old GPUs. A small Bash watcher follows focus and window-state changes through `xprop -spy`, so it sleeps until something actually changes, and pauses mpv while a fullscreen or maximized window is on top or the monitor is off.
+**X11.** A one-shot python call creates a desktop-type window and exits. mpv draws into it with `--wid`, using Xv where available, which is the cheapest path on old GPUs. A small Bash watcher follows focus and window-state changes through `xprop -spy`, so it sleeps until something actually changes, and pauses mpv while a fullscreen or maximized window is on top or the monitor is off. It also listens for RandR screen changes through `xev`, and lays the wallpaper out again when a monitor is added, removed or resized.
 
-**Wayland.** lowpaper builds a small C helper the first time it is needed and keeps it in `~/.cache/lowpaper`. The helper speaks the wlr-layer-shell protocol directly, places one background surface per output, and renders through libmpv. It declares the few Wayland, EGL and libmpv functions it uses itself, so no `-dev` packages are needed: only gcc and the libraries mpv already depends on. A compositor stops sending frame callbacks to a surface nobody can see; the helper uses that to pause.
+**Wayland.** lowpaper builds a small C helper the first time it is needed and keeps it in `~/.cache/lowpaper`. The helper speaks the wlr-layer-shell protocol directly, places one background surface per output, and renders through libmpv. It declares the few Wayland, EGL and libmpv functions it uses itself, so no `-dev` packages are needed: only gcc and the libraries mpv already depends on. A compositor stops sending frame callbacks to a surface nobody can see; the helper uses that to pause. When an output appears or disappears, it lays the wallpaper out again.
 
 **Short clips** are decoded once and replayed from RAM, which takes the decoder out of the loop. Longer videos fall back to normal decoding. `CACHE_MB` sets the limit.
 
@@ -95,5 +106,6 @@ Linux Mint 22.3 XFCE/X11, Core2 Duo P8600, GeForce 320M (nouveau, no usable hwde
 
 ## Known limits
 
-- After a resolution or monitor change, or if xfdesktop restarts on its own, run `lowpaper restore`.
+- If xfdesktop restarts on its own, run `lowpaper restore`.
+- If `lowpaper status` says `stopped`, mpv's error is in the log file it names.
 - On Wayland, `lowpaper autopause on|off` applies from the next start.

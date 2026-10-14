@@ -24,3 +24,9 @@ jobs:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y mpv xvfb xserver-xorg-core xserver-xorg-video-dummy x11-utils x11-xserver-utils ffmpeg netcat-openbsd libgl1-mesa-dri
       - run: bash tests/x11.sh
+
+  update:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash tests/update.sh
