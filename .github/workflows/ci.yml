@@ -1,0 +1,26 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck --severity=warning lowpaper tests/*.sh
+
+  wayland:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y mpv sway ffmpeg libegl-mesa0 libgl1-mesa-dri
+      - run: bash tests/wayland.sh
+
+  x11:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y mpv xvfb x11-utils x11-xserver-utils ffmpeg netcat-openbsd libgl1-mesa-dri
+      - run: bash tests/x11.sh
