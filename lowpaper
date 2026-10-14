@@ -593,7 +593,7 @@ set_wallpaper() {  # [options] FILE|DIR...
       [ -n "$wid" ] && xwininfo -id "$wid" >/dev/null 2>&1 \
         || { wid=$(py win "$x" "$y" "$w" "$h" ${so:+under}) || die "could not create window"; new=new; }
       sock=$RUN/$name.sock
-      setsid mpv "${opts[@]}" --vo=xv,gpu --wid="$wid" --input-ipc-server="$sock" "$@" </dev/null >"$RUN/$name.log" 2>&1 &
+      setsid mpv "${opts[@]}" --vo=xv,gpu,x11 --wid="$wid" --input-ipc-server="$sock" "$@" </dev/null >"$RUN/$name.log" 2>&1 &
       echo "$name $! $wid $sock" >> "$STATE"
     done < <(monitors)
     for wid in "${old[@]}"; do xkill -id "$wid" >/dev/null 2>&1; done
