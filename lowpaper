@@ -11,9 +11,11 @@ CFG=${XDG_CONFIG_HOME:-$HOME/.config}/lowpaper
 RUN=${XDG_RUNTIME_DIR:-/tmp}/lowpaper-$(id -u)
 CONF=$CFG/config STATE=$RUN/state LIST=$RUN/playlist.m3u AUTOSTART=$HOME/.config/autostart/lowpaper.desktop
 mkdir -p "$CFG" "$RUN"
-FIT=fill INTERVAL=300 SHUFFLE=0 AUDIO=0 AUTOPAUSE=1 HWDEC= CACHE_MB=256 ICONS=1
+FIT=fill INTERVAL=300 SHUFFLE=0 AUDIO=0 AUTOPAUSE=1 HWDEC='' CACHE_MB=256 ICONS=1
+# shellcheck source=/dev/null
 [ -f "$CONF" ] && . "$CONF"
 
+VERSION=0.1.1
 VIDEO='mp4|mkv|webm|mov|avi|m4v|gif'
 IMAGE='jpg|jpeg|png|webp|bmp|avif|jxl|tif|tiff'
 
@@ -113,22 +115,24 @@ toggle() { if [ "$(first_get pause)" = true ]; then resume; else pause; fi; }
 status() {
   [ -s "$STATE" ] || { echo "not running"; return 1; }
   _st() {
-    kill -0 "$pid" 2>/dev/null || { echo "$name  stopped"; return; }
+    kill -0 "$pid" 2>/dev/null || { echo "$name  stopped (see $RUN/$name.log)"; return; }
     local r; mapfile -t r < <(ipc "$sock" '["get_property","pause"]' '["get_property","path"]')
     echo "$name  $([ "${r[0]:-}" = true ] && echo paused || echo playing)  ${r[1]:-?}"
   }
   each _st
 }
 
-# Pause while the focused window is fullscreen/maximized or the monitor is off; clean up if mpv dies.
-# Event driven: xprop -spy reports focus and window-state changes, so it costs nothing while idle.
+# Pause while the focused window is fullscreen/maximized or the monitor is off; clean up if mpv dies;
+# lay the wallpaper out again when a monitor is added, removed or resized.
+# Event driven: xprop -spy and xev report changes, so it costs nothing while idle.
 watch() {
-  local fifo=$RUN/watch.fifo last= s= a line root win= alive p off=0
+  local fifo=$RUN/watch.fifo last='' s='' a line root win='' rr='' alive p off=0
   echo $$ > "$RUN/watch.pid"
   rm -f "$fifo"; mkfifo "$fifo"; exec 3<>"$fifo"; rm -f "$fifo"
   trap 'last=' USR1
-  trap 'kill $root $win 2>/dev/null; exit' TERM EXIT
+  trap 'kill $root $win $rr 2>/dev/null; exit' TERM EXIT
   xprop -root -spy -notype _NET_ACTIVE_WINDOW >&3 2>/dev/null & root=$!
+  have xev && { xev -root -event randr >&3 2>/dev/null & rr=$!; }
   while :; do
     if read -r -t 10 line <&3; then
       case $line in
@@ -137,12 +141,16 @@ watch() {
           [ -n "$win" ] && kill "$win" 2>/dev/null; win=
           [[ $a == 0x* && $a != 0x0 ]] && { xprop -id "$a" -spy -notype _NET_WM_STATE >&3 2>/dev/null & win=$!; } ;;
         _NET_WM_STATE*) s=$line ;;
+        RRScreenChangeNotify*)  # a change comes as several events: act once. restore replaces this watcher
+          [ -n "$rr" ] && { kill "$rr" 2>/dev/null; rr=''
+            setsid sh -c 'sleep 2; exec "$0" restore' "$SELF" </dev/null >/dev/null 2>&1 & } ;;
       esac
     else  # timeout or USR1
       alive=0; _alive() { kill -0 "$pid" 2>/dev/null && alive=1; }; each _alive
       [ $alive = 1 ] || { stop; exit; }
       off=0; xset q 2>/dev/null | grep -q 'Monitor is Off' && off=1
     fi
+    # shellcheck source=/dev/null
     [ -f "$CONF" ] && . "$CONF"
     if [ "$AUTOPAUSE" != 1 ] || [ -e "$RUN/paused" ]; then last=; continue; fi
     p=false; [ $off = 1 ] && p=true
@@ -212,23 +220,20 @@ xfdesktop_over() {  # restart xfdesktop with the shim; mapped last, it lands abo
   local p; p=$(pgrep -xo xfdesktop) && grep -qs "$1" "/proc/$p/maps" && [ "${2:-}" != new ] && return
   xfdesktop --quit 2>/dev/null
   for _ in $(seq 30); do pgrep -x xfdesktop >/dev/null || break; sleep 0.1; done
-  LD_PRELOAD=$1 setsid xfdesktop </dev/null >/dev/null 2>&1 &
+  LD_PRELOAD=$1 setsid xfdesktop </dev/null >/dev/null 2>&1 9>&- &
 }
 
 # ---------- Wayland ----------
-wl_helper() {  # prints the helper path, building it on first use
-  local bin=${XDG_CACHE_HOME:-$HOME/.cache}/lowpaper/wl1/lowpaper-wl
-  [ -x "$bin" ] && { echo "$bin"; return; }
-  have gcc || die "Wayland needs gcc once, to build a small helper (sudo apt install gcc)"
-  mkdir -p "${bin%/*}"
-  gcc -O2 -o "$bin" -x c - -l:libwayland-client.so.0 -l:libwayland-egl.so.1 -l:libEGL.so.1 -l:libmpv.so.2 <<'C' \
-    || die "could not build the Wayland helper (needs libmpv2, libwayland-egl1, libegl1)"
+wl_helper() {  # prints the helper path, building it on first use and again whenever its source changes
+  local src bin dir=${XDG_CACHE_HOME:-$HOME/.cache}/lowpaper
+  IFS= read -r -d '' src <<'C' || true
 /* lowpaper-wl: libmpv on a wlr-layer-shell background surface.
  * Builds with gcc alone: the few wayland/EGL/libmpv declarations it needs are written out here,
  * so no -dev packages are required, only the runtime libraries every Wayland desktop with mpv has.
  *   lowpaper-wl --list                          print output names
- *   lowpaper-wl OUTPUT [--nopause] [--mpv-option=value]... FILE
- * Hidden-wallpaper pause: the compositor stops sending frame callbacks to a surface nobody can see. */
+ *   lowpaper-wl OUTPUT [--nopause] [--restore-with=LOWPAPER] [--mpv-option=value]... FILE
+ * Hidden-wallpaper pause: the compositor stops sending frame callbacks to a surface nobody can see.
+ * Monitor hotplug: with --restore-with, an output appearing or disappearing runs `LOWPAPER restore`. */
 #include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -282,11 +287,11 @@ EGLContext eglCreateContext(EGLDisplay, EGLConfig, EGLContext, const EGLint *);
 EGLSurface eglCreateWindowSurface(EGLDisplay, EGLConfig, void *, const EGLint *);
 void *eglGetProcAddress(const char *);
 
-/* ---- libmpv (client API 2) ---- */
+/* ---- libmpv (client API 1 or 2) ---- */
 typedef struct mpv_handle mpv_handle; typedef struct mpv_render_context mpv_render_context;
 typedef struct { int event_id, error; uint64_t reply_userdata; void *data; } mpv_event;
 typedef struct { int type; void *data; } mpv_render_param;
-typedef struct { void *(*get_proc_address)(void *, const char *); void *ctx; } mpv_opengl_init_params;
+typedef struct { void *(*get_proc_address)(void *, const char *); void *ctx; const char *extra_exts; } mpv_opengl_init_params;  /* extra_exts: API 1 only */
 typedef struct { int fbo, w, h, internal_format; } mpv_opengl_fbo;
 mpv_handle *mpv_create(void);
 int mpv_set_option_string(mpv_handle *, const char *, const char *), mpv_initialize(mpv_handle *),
@@ -302,8 +307,9 @@ uint64_t mpv_render_context_update(mpv_render_context *);
 
 /* ---- state ---- */
 #define MAXOUT 16
-static struct { struct wl_proxy *p; char name[64]; int scale; } out[MAXOUT];
-static int nout, wakefd[2], width, height, scale = 1, configured, dirty, autopaused, nopause, hwdec;
+static struct { struct wl_proxy *p; uint32_t id; char name[64]; int scale; } out[MAXOUT];
+static int nout, cur = -1, ready, changed, wakefd[2], width, height, scale = 1, configured, dirty, autopaused, nopause, hwdec;
+static const char *restore_with;
 static struct wl_display *dpy;
 static struct wl_proxy *compositor, *shell, *surface, *callback;
 static struct wl_egl_window *ewin;
@@ -323,8 +329,15 @@ static void o_desc(void *d, struct wl_proxy *o, const char *n) {}
 static void (*out_l[])() = { (void (*)())o_geometry, (void (*)())o_mode, (void (*)())o_done, (void (*)())o_scale,
                              (void (*)())o_name, (void (*)())o_desc };
 
+static void outputs_changed(void) {  /* let lowpaper lay the wallpaper out again, once things settle */
+  if (!restore_with || changed) return;
+  changed = 1;
+  if (fork() == 0) { setsid(); execl("/bin/sh", "sh", "-c", "sleep 2; exec \"$0\" restore", restore_with, (char *)NULL); _exit(1); }
+}
+
 static void g_add(void *d, struct wl_proxy *reg, uint32_t id, const char *iface, uint32_t ver) {
   const struct wl_interface *i = NULL; uint32_t v = 1;
+  if (ready) { if (!strcmp(iface, "wl_output")) outputs_changed(); return; }
   if (!strcmp(iface, "wl_compositor")) i = &wl_compositor_interface, v = ver < 4 ? ver : 4;
   else if (!strcmp(iface, "zwlr_layer_shell_v1")) i = &zwlr_layer_shell_v1_interface;
   else if (!strcmp(iface, "wl_output") && nout < MAXOUT) i = &wl_output_interface, v = ver < 4 ? ver : 4;
@@ -332,10 +345,13 @@ static void g_add(void *d, struct wl_proxy *reg, uint32_t id, const char *iface,
   struct wl_proxy *p = wl_proxy_marshal_constructor_versioned(reg, 0, i, v, id, i->name, v, NULL);
   if (i == &wl_compositor_interface) compositor = p;
   else if (i == &zwlr_layer_shell_v1_interface) shell = p;
-  else { out[nout].p = p; out[nout].scale = 1; snprintf(out[nout].name, 64, "%d", nout);
+  else { out[nout].p = p; out[nout].id = id; out[nout].scale = 1; snprintf(out[nout].name, 64, "%d", nout);
          LISTEN(p, out_l, (void *)(intptr_t)nout); nout++; }
 }
-static void g_remove(void *d, struct wl_proxy *reg, uint32_t id) {}
+static void g_remove(void *d, struct wl_proxy *reg, uint32_t id) {
+  for (int i = 0; ready && i < nout; i++)
+    if (out[i].id == id) { outputs_changed(); if (i == cur) exit(0); }  /* our monitor is gone */
+}
 static void (*reg_l[])() = { (void (*)())g_add, (void (*)())g_remove };
 
 static void l_configure(void *d, struct wl_proxy *ls, uint32_t serial, uint32_t w, uint32_t h) {
@@ -380,7 +396,7 @@ int main(int argc, char **argv) {
   if (!shell) die("this compositor has no wlr-layer-shell (GNOME: use the Hanabi extension)");
   int o = -1; for (int i = 0; i < nout; i++) if (!strcmp(out[i].name, argv[1])) o = i;
   if (o < 0) die("output not found");
-  scale = out[o].scale;
+  scale = out[o].scale; cur = o; ready = 1;
 
   /* mpv: lowpaper passes the same --options it gives the mpv binary on X11 */
   if (!(mpv = mpv_create())) die("mpv_create failed");
@@ -391,6 +407,7 @@ int main(int argc, char **argv) {
     if (!strcmp(a, "--nopause")) { nopause = 1; continue; }
     if (strncmp(a, "--", 2)) { file = a; continue; }
     if (!strncmp(a, "--playlist=", 11)) { list = a + 11; continue; }
+    if (!strncmp(a, "--restore-with=", 15)) { restore_with = a + 15; continue; }
     snprintf(k, sizeof k, "%s", a + 2); eq = strchr(k, '=');
     const char *v = "yes"; if (eq) *eq = 0, v = eq + 1;
     else if (!strncmp(k, "no-", 3)) memmove(k, k + 3, strlen(k + 3) + 1), v = "no";
@@ -431,7 +448,7 @@ int main(int argc, char **argv) {
   if (!esurf || !eglMakeCurrent(edpy, esurf, esurf, ctx)) die("EGL surface failed");
   eglSwapInterval(edpy, 0);  /* pacing comes from frame callbacks, never block in swap */
 
-  mpv_opengl_init_params gl = { gpa, NULL };
+  mpv_opengl_init_params gl = { gpa, NULL, NULL };
   mpv_render_param rp[] = { { 1, "opengl" }, { 2, &gl }, { hwdec ? 9 : 0, dpy }, { 0, NULL } };  /* 9: WL_DISPLAY, for hwdec */
   if (mpv_render_context_create(&rctx, mpv, rp) < 0) die("mpv render context failed");
   if (pipe(wakefd)) die("pipe");
@@ -459,6 +476,15 @@ int main(int argc, char **argv) {
   }
 }
 C
+  bin=$dir/wl-$(printf '%s' "$src" | cksum | cut -d' ' -f1)/lowpaper-wl
+  [ -x "$bin" ] && { echo "$bin"; return; }
+  have gcc || die "Wayland needs gcc once, to build a small helper (sudo apt install gcc)"
+  rm -rf "$dir"/wl[0-9-]*; mkdir -p "${bin%/*}"
+  local m; for m in 2 1 ''; do  # libmpv.so.2 (mpv >= 0.35), .so.1 on older distros
+    [ -n "$m" ] || die "could not build the Wayland helper (needs libmpv2 or libmpv1, libwayland-egl1, libegl1; see $dir/build.log)"
+    gcc -O2 -o "$bin" -x c - -l:libwayland-client.so.0 -l:libwayland-egl.so.1 -l:libEGL.so.1 -l:libmpv.so.$m \
+      <<< "$src" 2>"$dir/build.log" && break
+  done
   echo "$bin"
 }
 
@@ -483,7 +509,8 @@ frame_cache() {  # a short loop fits in RAM: decode it once, then replay the fra
 }
 
 set_wallpaper() {  # [options] FILE|DIR...
-  local out= mpvonly=0 a f n abs=() fo
+  local out='' mpvonly=0 a f n abs=() fo fit last
+  have flock && { exec 9>"$RUN/lock"; flock 9; }  # one at a time (a hotplug restore can meet a user command)
   while [ $# -gt 0 ]; do case $1 in
     -f|--fit) FIT=$2; shift 2 ;;
     -i|--interval) INTERVAL=$2; shift 2 ;;
@@ -497,7 +524,7 @@ set_wallpaper() {  # [options] FILE|DIR...
   esac; done
   [ $# -gt 0 ] || die "need a file or folder"
   have mpv || die "mpv is required"
-  fo=($(fit_opts "$FIT")) || die "--fit must be fill|fit|stretch"
+  fit=$(fit_opts "$FIT") || die "--fit must be fill|fit|stretch"; read -r -a fo <<< "$fit"
   if [ -n "$out" ]; then  # check before stopping the current wallpaper or touching `last`
     local names
     if [ -n "${WAYLAND_DISPLAY:-}" ]; then local wl; wl=$(wl_helper) || exit 1; names=$("$wl" --list) || exit 1
@@ -516,8 +543,9 @@ set_wallpaper() {  # [options] FILE|DIR...
   n=$(wc -l < "$LIST.new"); [ "$n" -gt 0 ] || die "no images or videos found"
   mv "$LIST.new" "$LIST"; f=$(head -1 "$LIST")
   # remember for `lowpaper restore` (autostart)
-  printf '%q ' -f "$FIT" -i "$INTERVAL" $([ $SHUFFLE = 1 ] && echo -s) $([ $AUDIO = 1 ] && echo -a) \
-    ${out:+-o "$out"} $([ $mpvonly = 1 ] && echo --mpv) -- "${abs[@]}" > "$CFG/last"
+  last=(-f "$FIT" -i "$INTERVAL"); [ "$SHUFFLE" = 1 ] && last+=(-s); [ "$AUDIO" = 1 ] && last+=(-a)
+  [ -n "$out" ] && last+=(-o "$out"); [ $mpvonly = 1 ] && last+=(--mpv)
+  printf '%q ' "${last[@]}" -- "${abs[@]}" > "$CFG/last"
 
   if [ "$n" = 1 ] && is_image "$f" && [ $mpvonly = 0 ] && [ -z "${WAYLAND_DISPLAY:-}" ] && xfce; then
     stop; native_image "$f"
@@ -525,7 +553,7 @@ set_wallpaper() {  # [options] FILE|DIR...
   fi
   stop keep
 
-  local opts=(--no-config --no-terminal --osc=no --osd-level=0 --load-scripts=no --ytdl=no
+  local opts=(--no-config --terminal=yes --input-terminal=no --msg-level=all=warn --msg-color=no --term-osd=no --osc=no --osd-level=0 --load-scripts=no --ytdl=no
     --input-default-bindings=no --input-vo-keyboard=no --cursor-autohide=always --stop-screensaver=no
     --sid=no --profile=fast --framedrop=vo --cache=no --demuxer-max-bytes=4MiB --demuxer-max-back-bytes=0
     --panscan="${fo[0]}" --keepaspect="${fo[1]}")
@@ -542,12 +570,14 @@ set_wallpaper() {  # [options] FILE|DIR...
 
   if [ -n "${WAYLAND_DISPLAY:-}" ]; then
     local wl name; wl=$(wl_helper) || exit 1
-    local outs; outs=$("$wl" --list) || exit 1
+    local outs lead=--restore-with=$SELF np=''; outs=$("$wl" --list) || exit 1
+    [ "$AUTOPAUSE" = 1 ] || np=--nopause
     : > "$STATE"
     for name in $outs; do
       [ -z "$out" ] || [ "$out" = "$name" ] || continue
-      setsid "$wl" "$name" $([ "$AUTOPAUSE" = 1 ] || echo --nopause) "${opts[@]}" --input-ipc-server="$RUN/$name.sock" "$@" \
-        </dev/null >/dev/null 2>&1 &
+      setsid "$wl" "$name" ${np:+"$np"} ${lead:+"$lead"} "${opts[@]}" \
+        --input-ipc-server="$RUN/$name.sock" "$@" </dev/null >"$RUN/$name.log" 2>&1 9>&- &
+      lead=  # one helper is enough to notice a monitor change
       echo "$name $! - $RUN/$name.sock" >> "$STATE"
     done
     [ -s "$STATE" ] || die "output not found: ${out} (outputs: $(echo $outs))"
@@ -564,19 +594,20 @@ set_wallpaper() {  # [options] FILE|DIR...
       [ -n "$wid" ] && xwininfo -id "$wid" >/dev/null 2>&1 \
         || { wid=$(py win "$x" "$y" "$w" "$h" ${so:+under}) || die "could not create window"; new=new; }
       sock=$RUN/$name.sock
-      setsid mpv "${opts[@]}" --vo=xv,gpu --wid="$wid" --input-ipc-server="$sock" "$@" </dev/null >/dev/null 2>&1 &
+      setsid mpv "${opts[@]}" --vo=xv,gpu,x11 --wid="$wid" --input-ipc-server="$sock" "$@" </dev/null >"$RUN/$name.log" 2>&1 9>&- &
       echo "$name $! $wid $sock" >> "$STATE"
     done < <(monitors)
     for wid in "${old[@]}"; do xkill -id "$wid" >/dev/null 2>&1; done
     [ -s "$STATE" ] || die "monitor not found: ${out}"
     [ -n "$so" ] && xfdesktop_over "$so" $new
-    setsid "$SELF" _watch </dev/null >/dev/null 2>&1 &
+    setsid "$SELF" _watch </dev/null >/dev/null 2>&1 9>&- &
+    echo $! > "$RUN/watch.pid"  # now, so a stop right after this cannot miss it
   fi
   echo "Wallpaper started ($n file(s)): $f"
 }
 
 set_fit() {  # change fit live and remember it
-  local fo; fo=($(fit_opts "$1")) || die "fit must be fill|fit|stretch"
+  local fit fo; fit=$(fit_opts "$1") || die "fit must be fill|fit|stretch"; read -r -a fo <<< "$fit"
   conf_set FIT "$1"
   ipc_all "[\"set_property\",\"panscan\",${fo[0]}]"; ipc_all "[\"set_property\",\"keepaspect\",$([ "${fo[1]}" = yes ] && echo true || echo false)]"
   [ -f "$CFG/last" ] && sed -i "s/^-f [a-z]*/-f $1/" "$CFG/last"
@@ -606,20 +637,39 @@ autopause() {
   echo "auto-pause $([ "$AUTOPAUSE" = 1 ] && echo on || echo off)"
 }
 
+update() {  # replace this file with the latest release, then restart a running wallpaper with it
+  local url=https://github.com/Meinianda-L/lowpaper/releases/latest/download/lowpaper tmp new
+  [ -w "$SELF" ] && [ -w "${SELF%/*}" ] || die "cannot write $SELF; if a package manager installed it, update it there"
+  tmp=$(mktemp "${SELF%/*}/.lowpaper.XXXXXX") || die "cannot create a temporary file next to $SELF"
+  if have curl; then curl -fsSL -o "$tmp" "$url"; elif have wget; then wget -qO "$tmp" "$url"; else false; fi \
+    || { rm -f "$tmp"; die "download failed (needs curl or wget): $url"; }
+  head -1 "$tmp" | grep -q bash && bash -n "$tmp" 2>/dev/null || { rm -f "$tmp"; die "the download is not a lowpaper script"; }
+  new=$(sed -n 's/^VERSION=//p' "$tmp" | head -1); new=${new:-0}  # 0.1.0 had no VERSION line
+  if [ "$(printf '%s\n' "$new" "$VERSION" | sort -V | tail -1)" = "$VERSION" ]; then
+    rm -f "$tmp"; echo "lowpaper $VERSION is up to date (latest release: $new)"; return
+  fi
+  chmod 755 "$tmp" && mv -f "$tmp" "$SELF"  # a new file, so a running copy keeps reading the old one
+  echo "updated lowpaper $VERSION -> ${new:-unknown}"
+  [ -s "$STATE" ] && "$SELF" restore >/dev/null && echo "wallpaper restarted with the new version"
+  return 0
+}
+
 usage() { cat <<EOF
-lowpaper - video/image wallpaper light enough for old hardware (rendered by mpv)
+lowpaper $VERSION - video/image wallpaper light enough for old hardware (rendered by mpv)
   lowpaper                    show what is playing
   lowpaper [options] FILE|DIR set the wallpaper; several files/folders = slideshow
      -f fill|fit|stretch        scaling (default $FIT)
      -i SECONDS                 image slideshow interval (default $INTERVAL)
      -s                         shuffle
      -a                         enable audio (default: muted, audio not decoded)
-     -o MONITOR                 only this monitor (see xrandr --listmonitors)
+     -o MONITOR                 only this monitor (a wrong name lists the available ones)
      --mpv                      use mpv even for a single image (default on XFCE: the desktop shows it)
   lowpaper pause|resume|toggle|next|stop|status|restore
   lowpaper fit fill|fit|stretch   change scaling live
   lowpaper autopause on|off       pause while a window is fullscreen/maximized (default on)
   lowpaper startup on|off         start at login, restoring the last wallpaper
+  lowpaper update                 install the latest release over this file
+  lowpaper version
 EOF
 }
 
@@ -629,7 +679,10 @@ case ${1:-} in
   next) ipc_all '["playlist-next"]' ;;
   fit) set_fit "${2:-}" ;;
   startup|autopause) "$1" "${2:-}" ;;
+  update) update ;;
+  version|-v|--version) echo "lowpaper $VERSION" ;;
   _watch) watch ;;
+  _build) wl_helper ;;  # build the Wayland helper now (used by CI)
   help|-h|--help) usage ;;
   *) set_wallpaper "$@" ;;
 esac

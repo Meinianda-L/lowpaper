@@ -1,0 +1,49 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck --severity=warning lowpaper tests/*.sh
+
+  wayland:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y mpv libmpv2 sway ffmpeg libegl-mesa0 libgl1-mesa-dri
+      - run: bash tests/wayland.sh
+
+  x11:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y mpv xvfb xserver-xorg-core xserver-xorg-video-dummy x11-utils x11-xserver-utils ffmpeg netcat-openbsd libgl1-mesa-dri
+      - run: bash tests/x11.sh
+
+  update:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash tests/update.sh
+
+  aur:  # the PKGBUILD downloads the release, so it can only be checked once one is published
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    container: archlinux:latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: pacman -Syu --noconfirm --needed base-devel
+      - run: |
+          useradd -m builder
+          cp -r packaging/aur /home/builder/pkg && chown -R builder /home/builder/pkg
+          su builder -c 'cd ~/pkg && makepkg --nodeps --noconfirm && makepkg --printsrcinfo | diff - .SRCINFO'
+          pacman -Udd --noconfirm /home/builder/pkg/lowpaper-*.pkg.tar.zst
+          lowpaper version
