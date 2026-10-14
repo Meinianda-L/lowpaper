@@ -141,9 +141,9 @@ watch() {
           [ -n "$win" ] && kill "$win" 2>/dev/null; win=
           [[ $a == 0x* && $a != 0x0 ]] && { xprop -id "$a" -spy -notype _NET_WM_STATE >&3 2>/dev/null & win=$!; } ;;
         _NET_WM_STATE*) s=$line ;;
-        RRScreenChangeNotify*)  # restore replaces this watcher; give the desktop a moment to settle first
-          setsid sh -c 'sleep 2; exec "$0" restore' "$SELF" </dev/null >/dev/null 2>&1 &
-          kill $rr 2>/dev/null; rr= ;;
+        RRScreenChangeNotify*)  # a change comes as several events: act once. restore replaces this watcher
+          [ -n "$rr" ] && { kill "$rr" 2>/dev/null; rr=''
+            setsid sh -c 'sleep 2; exec "$0" restore' "$SELF" </dev/null >/dev/null 2>&1 & } ;;
       esac
     else  # timeout or USR1
       alive=0; _alive() { kill -0 "$pid" 2>/dev/null && alive=1; }; each _alive
@@ -220,7 +220,7 @@ xfdesktop_over() {  # restart xfdesktop with the shim; mapped last, it lands abo
   local p; p=$(pgrep -xo xfdesktop) && grep -qs "$1" "/proc/$p/maps" && [ "${2:-}" != new ] && return
   xfdesktop --quit 2>/dev/null
   for _ in $(seq 30); do pgrep -x xfdesktop >/dev/null || break; sleep 0.1; done
-  LD_PRELOAD=$1 setsid xfdesktop </dev/null >/dev/null 2>&1 &
+  LD_PRELOAD=$1 setsid xfdesktop </dev/null >/dev/null 2>&1 9>&- &
 }
 
 # ---------- Wayland ----------
@@ -510,6 +510,7 @@ frame_cache() {  # a short loop fits in RAM: decode it once, then replay the fra
 
 set_wallpaper() {  # [options] FILE|DIR...
   local out='' mpvonly=0 a f n abs=() fo fit last
+  have flock && { exec 9>"$RUN/lock"; flock 9; }  # one at a time (a hotplug restore can meet a user command)
   while [ $# -gt 0 ]; do case $1 in
     -f|--fit) FIT=$2; shift 2 ;;
     -i|--interval) INTERVAL=$2; shift 2 ;;
@@ -575,7 +576,7 @@ set_wallpaper() {  # [options] FILE|DIR...
     for name in $outs; do
       [ -z "$out" ] || [ "$out" = "$name" ] || continue
       setsid "$wl" "$name" ${np:+"$np"} ${lead:+"$lead"} "${opts[@]}" \
-        --input-ipc-server="$RUN/$name.sock" "$@" </dev/null >"$RUN/$name.log" 2>&1 &
+        --input-ipc-server="$RUN/$name.sock" "$@" </dev/null >"$RUN/$name.log" 2>&1 9>&- &
       lead=  # one helper is enough to notice a monitor change
       echo "$name $! - $RUN/$name.sock" >> "$STATE"
     done
@@ -593,13 +594,14 @@ set_wallpaper() {  # [options] FILE|DIR...
       [ -n "$wid" ] && xwininfo -id "$wid" >/dev/null 2>&1 \
         || { wid=$(py win "$x" "$y" "$w" "$h" ${so:+under}) || die "could not create window"; new=new; }
       sock=$RUN/$name.sock
-      setsid mpv "${opts[@]}" --vo=xv,gpu,x11 --wid="$wid" --input-ipc-server="$sock" "$@" </dev/null >"$RUN/$name.log" 2>&1 &
+      setsid mpv "${opts[@]}" --vo=xv,gpu,x11 --wid="$wid" --input-ipc-server="$sock" "$@" </dev/null >"$RUN/$name.log" 2>&1 9>&- &
       echo "$name $! $wid $sock" >> "$STATE"
     done < <(monitors)
     for wid in "${old[@]}"; do xkill -id "$wid" >/dev/null 2>&1; done
     [ -s "$STATE" ] || die "monitor not found: ${out}"
     [ -n "$so" ] && xfdesktop_over "$so" $new
-    setsid "$SELF" _watch </dev/null >/dev/null 2>&1 &
+    setsid "$SELF" _watch </dev/null >/dev/null 2>&1 9>&- &
+    echo $! > "$RUN/watch.pid"  # now, so a stop right after this cannot miss it
   fi
   echo "Wallpaper started ($n file(s)): $f"
 }
