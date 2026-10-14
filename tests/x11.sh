@@ -29,8 +29,8 @@ check "wrong -o fails" not "$L" -o NOPE "$T/clip.mp4"
 check "wrong -o keeps the wallpaper" grep -q "^$mon  playing" <<< "$(st)"
 
 before=$(mpvpid)
-# Xvfb has a single mode, so change the screen size by rotating the output
-xrandr --output "$mon" --rotate left
+# Xvfb has a single mode: switch the output off, shrink the screen, switch it back on
+xrandr --output "$mon" --off --fb 1024x768 && xrandr --output "$mon" --auto
 # restore waits up to 20s for a desktop window, and Xvfb has none
 for _ in $(seq 40); do [ "$(mpvpid)" != "$before" ] && [ -n "$(mpvpid)" ] && break; sleep 1; done
 st
