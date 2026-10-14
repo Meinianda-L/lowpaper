@@ -1,0 +1,24 @@
+pkgbase = lowpaper
+	pkgdesc = Lightweight video wallpaper for X11 and Wayland, made for low-end and old hardware
+	pkgver = 0.1.1
+	pkgrel = 1
+	url = https://github.com/Meinianda-L/lowpaper
+	arch = any
+	license = MIT
+	depends = bash
+	depends = mpv
+	optdepends = python: X11 support
+	optdepends = xorg-xprop: X11 support
+	optdepends = xorg-xrandr: X11 support
+	optdepends = xorg-xkill: X11 support
+	optdepends = xorg-xwininfo: X11 support
+	optdepends = xorg-xev: X11 monitor hotplug
+	optdepends = xorg-xset: X11 pause while the monitor is off
+	optdepends = gcc: Wayland support, and XFCE desktop icons above the video
+	optdepends = openbsd-netcat: faster control of mpv
+	source = lowpaper-0.1.1::https://github.com/Meinianda-L/lowpaper/releases/download/v0.1.1/lowpaper
+	source = LICENSE-0.1.1::https://raw.githubusercontent.com/Meinianda-L/lowpaper/v0.1.1/LICENSE
+	sha256sums = f2596b647c1d7241264712c5027a7644b6b9b0d7166f6b91691f62236c198d25
+	sha256sums = 0a09c24d8e883bdf2a32da4876a2abea39f15be460dc3d655be6344391760a9b
+
+pkgname = lowpaper

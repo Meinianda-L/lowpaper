@@ -3,6 +3,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  release:
+    types: [published]
+  workflow_dispatch:
 
 jobs:
   shellcheck:
@@ -30,3 +33,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: bash tests/update.sh
+
+  aur:  # the PKGBUILD downloads the release, so it can only be checked once one is published
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    container: archlinux:latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: pacman -Syu --noconfirm --needed base-devel
+      - run: |
+          useradd -m builder
+          cp -r packaging/aur /home/builder/pkg && chown -R builder /home/builder/pkg
+          su builder -c 'cd ~/pkg && makepkg --nodeps --noconfirm && makepkg --printsrcinfo | diff - .SRCINFO'
+          pacman -Udd --noconfirm /home/builder/pkg/lowpaper-*.pkg.tar.zst
+          lowpaper version
