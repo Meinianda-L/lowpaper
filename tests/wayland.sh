@@ -26,9 +26,12 @@ check "plays on HEADLESS-1" grep -q '^HEADLESS-1  playing' <<< "$(st)"
 check "wrong -o fails" not "$L" -o NOPE "$T/clip.mp4"
 check "wrong -o keeps the wallpaper" grep -q '^HEADLESS-1  playing' <<< "$(st)"
 
-swaymsg create_output >/dev/null; sleep 5; st
+swaymsg create_output >/dev/null
+for _ in $(seq 15); do sleep 1; grep -q '^HEADLESS-2  playing' <<< "$(st)" && break; done; st
 check "added monitor gets the wallpaper" grep -q '^HEADLESS-2  playing' <<< "$(st)"
-swaymsg output HEADLESS-2 unplug >/dev/null; sleep 5; st
+check "mpv runs with the fast profile" grep -qa -- --profile=fast "/proc/$(pgrep -x lowpaper-wl | head -1)/cmdline"
+swaymsg output HEADLESS-2 unplug >/dev/null
+for _ in $(seq 15); do sleep 1; grep -q HEADLESS-2 <<< "$(st)" || break; done; sleep 2; st
 check "removed monitor is dropped" not grep -q HEADLESS-2 <<< "$(st)"
 check "remaining monitor still plays" grep -q '^HEADLESS-1  playing' <<< "$(st)"
 

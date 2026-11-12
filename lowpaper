@@ -10,7 +10,7 @@ SELF=$(readlink -f "$0")
 CFG=${XDG_CONFIG_HOME:-$HOME/.config}/lowpaper
 RUN=${XDG_RUNTIME_DIR:-/tmp}/lowpaper-$(id -u)
 CONF=$CFG/config STATE=$RUN/state LIST=$RUN/playlist.m3u AUTOSTART=${XDG_CONFIG_HOME:-$HOME/.config}/autostart/lowpaper.desktop
-mkdir -p "$CFG"; mkdir -p -m 700 "$RUN"
+mkdir -p "$CFG" "$RUN"
 FIT=fill INTERVAL=300 SHUFFLE=0 AUDIO=0 AUTOPAUSE=1 HWDEC='' CACHE_MB=256 ICONS=1
 # shellcheck source=/dev/null
 [ -f "$CONF" ] && . "$CONF"
@@ -584,14 +584,15 @@ set_wallpaper() {  # [options] FILE|DIR...
     [ -n "${DISPLAY:-}" ] || die "no graphical session (DISPLAY is empty)"
     for a in python3 xrandr xprop xkill xwininfo; do have "$a" || die "X11 needs $a"; done
   fi
+  # mpv before 0.36 has no fast profile, and refuses to start when asked for one; asked once per session
+  [ -f "$RUN/fast" ] || { mpv --no-config --profile=help 2>/dev/null | grep -qw fast; echo $? > "$RUN/fast"; }
   stop keep
 
   local opts=(--no-config --terminal=yes --input-terminal=no --msg-level=all=warn --msg-color=no --term-osd=no --osc=no --osd-level=0 --load-scripts=no --ytdl=no
     --input-default-bindings=no --input-vo-keyboard=no --cursor-autohide=always --stop-screensaver=no
     --sid=no --framedrop=vo --cache=no --demuxer-max-bytes=4MiB --demuxer-max-back-bytes=0
     --panscan="${fo[0]}" --keepaspect="${fo[1]}")
-  # mpv before 0.36 has no fast profile, and refuses to start when asked for one
-  mpv --no-config --profile=help 2>/dev/null | grep -qw fast && opts+=(--profile=fast)
+  [ "$(cat "$RUN/fast")" = 0 ] && opts+=(--profile=fast)
   [ $AUDIO = 1 ] || opts+=(--aid=no)
   [ $SHUFFLE = 1 ] && opts+=(--shuffle)
   if [ "$n" -gt 1 ]; then opts+=(--loop-playlist=inf --image-display-duration="$INTERVAL"); set -- --playlist="$LIST"
