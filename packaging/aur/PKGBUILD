@@ -8,7 +8,7 @@ url="https://github.com/Meinianda-L/lowpaper"
 license=('MIT')
 depends=('bash' 'mpv')
 optdepends=(
-  'python: X11 support'
+  'python: X11 support, and control of mpv without openbsd-netcat'
   'xorg-xprop: X11 support'
   'xorg-xrandr: X11 support'
   'xorg-xkill: X11 support'
