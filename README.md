@@ -75,10 +75,10 @@ Settings live in `~/.config/lowpaper/config` (`FIT`, `INTERVAL`, `AUTOPAUSE`, `C
 | Environment | Needs |
 |---|---|
 | all | mpv |
-| X11 desktop with a desktop window (XFCE, MATE, Cinnamon, ...) | python3, xprop, xrandr, xkill, xev (preinstalled on Debian, Ubuntu, Mint; on Arch: `python xorg-xprop xorg-xrandr xorg-xkill xorg-xev`) |
+| X11 desktop with a desktop window (XFCE, MATE, Cinnamon, ...) | python3, xprop, xrandr, xkill, xwininfo, and optionally xev (monitor changes) and xset (pause while the monitor is off). Preinstalled on Debian, Ubuntu, Mint; on Arch: `python xorg-xprop xorg-xrandr xorg-xkill xorg-xwininfo xorg-xev xorg-xset` |
 | Wayland with layer-shell (Sway, Hyprland, KDE, ...) | gcc, used once to build a 30 KB helper, and libmpv (Debian/Ubuntu: `libmpv2`, Fedora: `mpv-libs`, included in Arch's `mpv`) |
 
-Optional: `gcc` also keeps XFCE desktop icons above the video. OpenBSD `nc` (default on Debian and Ubuntu) is used for mpv IPC, about 3 ms per call; without it lowpaper falls back to python, which is much slower on old CPUs.
+Optional: `gcc` also keeps XFCE desktop icons above the video. OpenBSD `nc` (default on Debian and Ubuntu) is used for mpv IPC, about 3 ms per call; without it (other `nc` variants such as ncat do not qualify) lowpaper falls back to python3, which is much slower on old CPUs. One of the two is needed, on Wayland too, for pause, resume, status and live fit changes.
 
 GNOME on Wayland has no layer-shell; use the Hanabi extension there. Bare window managers (i3, openbox) without a desktop window are not supported.
 
@@ -99,7 +99,7 @@ Linux Mint 22.3 XFCE/X11, Core2 Duo P8600, GeForce 320M (nouveau, no usable hwde
 | playing: mpv (short clip, decoded once and replayed from RAM) | 2.1% | 138 MB |
 | playing: mpv (decoding every loop, `CACHE_MB=0`) | 13.9% | 94 MB |
 | playing: Xorg + xfwm4 compositor, icons above the video | 12–14% | |
-| watcher (bash + 2 × xprop) | ~0% | 8 MB |
+| watcher (bash + 2 × xprop + xev) | ~0% | 8 MB |
 | covered by a fullscreen or maximized window | 0% | same |
 | single image on XFCE | 0 | 0 |
 | single image through mpv (`--mpv` or slideshow) | 0 | ~200 MB |
@@ -109,3 +109,4 @@ Linux Mint 22.3 XFCE/X11, Core2 Duo P8600, GeForce 320M (nouveau, no usable hwde
 - If xfdesktop restarts on its own, run `lowpaper restore`.
 - If `lowpaper status` says `stopped`, mpv's error is in the log file it names.
 - On Wayland, `lowpaper autopause on|off` applies from the next start.
+- On Wayland, a wallpaper set with `-o MONITOR` does not come back by itself when that monitor is unplugged and plugged in again; run `lowpaper restore`.

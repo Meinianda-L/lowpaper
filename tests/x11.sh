@@ -13,6 +13,7 @@ check() { local d=$1; shift; if "$@"; then echo "ok   $d"; else echo "FAIL $d"; 
 not() { ! "$@"; }
 st() { "$L" status; }
 mpvpid() { awk 'NR==1{print $2}' "$XDG_RUNTIME_DIR/lowpaper-$(id -u)/state" 2>/dev/null; }
+wid() { awk 'NR==1{print $3}' "$XDG_RUNTIME_DIR/lowpaper-$(id -u)/state" 2>/dev/null; }
 watcher() { pgrep -f "^bash $L _watch" >/dev/null; }
 
 ffmpeg -loglevel error -f lavfi -i testsrc=size=320x240:rate=10:duration=2 -pix_fmt yuv420p "$T/clip.mp4"
@@ -43,6 +44,9 @@ check "watcher runs" watcher
 "$L" resume; check "resume" grep -q playing <<< "$(st)"
 check "wrong -o fails" not "$L" -o NOPE "$T/clip.mp4"
 check "wrong -o keeps the wallpaper" grep -q "^$mon  playing" <<< "$(st)"
+check "an option without its value fails" not "$L" -f
+before=$(wid); "$L" "$T/clip.mp4"; sleep 1
+check "an unchanged monitor keeps its window" test -n "$before" -a "$(wid)" = "$before"
 
 before=$(mpvpid)
 if resize; then
@@ -51,6 +55,7 @@ if resize; then
   st
   check "resolution change lays the wallpaper out again" test -n "$(mpvpid)" -a "$(mpvpid)" != "$before"
   check "still plays after the change" grep -q "^$mon  playing" <<< "$(st)"
+  check "the window has the new size" grep -q 'Width: 1024' <<< "$(xwininfo -id "$(wid)")"
 else
   echo "skip resolution change (needs Xorg with the dummy driver)"
 fi

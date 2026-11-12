@@ -9,7 +9,7 @@ PATH=$HOME/.local/bin:$PATH
 SELF=$(readlink -f "$0")
 CFG=${XDG_CONFIG_HOME:-$HOME/.config}/lowpaper
 RUN=${XDG_RUNTIME_DIR:-/tmp}/lowpaper-$(id -u)
-CONF=$CFG/config STATE=$RUN/state LIST=$RUN/playlist.m3u AUTOSTART=$HOME/.config/autostart/lowpaper.desktop
+CONF=$CFG/config STATE=$RUN/state LIST=$RUN/playlist.m3u AUTOSTART=${XDG_CONFIG_HOME:-$HOME/.config}/autostart/lowpaper.desktop
 mkdir -p "$CFG" "$RUN"
 FIT=fill INTERVAL=300 SHUFFLE=0 AUDIO=0 AUTOPAUSE=1 HWDEC='' CACHE_MB=256 ICONS=1
 # shellcheck source=/dev/null
@@ -21,6 +21,7 @@ IMAGE='jpg|jpeg|png|webp|bmp|avif|jxl|tif|tiff'
 
 die() { echo "lowpaper: $*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
+[ -O "$RUN" ] || die "$RUN belongs to another user"  # the /tmp fallback: never trust someone else's state file
 conf_set() { touch "$CONF"; sed -i "/^$1=/d" "$CONF"; echo "$1=$2" >> "$CONF"; eval "$1=\$2"; }
 is_media() { [[ ${1,,} =~ \.($VIDEO|$IMAGE)$ ]]; }
 is_image() { [[ ${1,,} =~ \.($IMAGE)$ ]]; }
@@ -84,10 +85,11 @@ PY
 ipc() {  # ipc SOCKET JSON... -> one line of reply data per command
   local sock=$1 req line i=0 c; local -a d; shift
   for c; do req+=${req:+$'\n'}"{\"command\":$c,\"request_id\":$((i++))}"; done
-  [ -n "${NC+x}" ] || NC=$(nc -h 2>&1 | grep -q -- -U && echo 1)
+  # only OpenBSD nc will do: ncat (Fedora's nc) has -U but no -N
+  [ -n "${NC+x}" ] || { NC=$(nc -h 2>&1); if [[ $NC == *-U* && $NC == *-N* ]]; then NC=1; else NC=; fi; }
   while read -r line; do
     [[ $line =~ \"data\":\"?(.*[^\"])?\"?,\"request_id\":([0-9]+) ]] && d[BASH_REMATCH[2]]=${BASH_REMATCH[1]}
-  done < <(if [ -n "$NC" ]; then echo "$req" | nc -N -U "$sock"; else py ipc "$sock" "$req"; fi 2>/dev/null)
+  done < <(if [ -n "$NC" ]; then echo "$req" | nc -N -U -w 2 "$sock"; else py ipc "$sock" "$req"; fi 2>/dev/null)
   for ((i = 0; i < $#; i++)); do echo "${d[i]:-}"; done
 }
 each() { [ -s "$STATE" ] && while read -r name pid wid sock; do "$@"; done < "$STATE"; }
@@ -126,26 +128,31 @@ status() {
 # lay the wallpaper out again when a monitor is added, removed or resized.
 # Event driven: xprop -spy and xev report changes, so it costs nothing while idle.
 watch() {
-  local fifo=$RUN/watch.fifo last='' s='' a line root win='' rr='' alive p off=0
+  local fifo=$RUN/watch.fifo last='' s='' a line root win='' rr='' alive p off=0 rearm=''
   echo $$ > "$RUN/watch.pid"
   rm -f "$fifo"; mkfifo "$fifo"; exec 3<>"$fifo"; rm -f "$fifo"
   trap 'last=' USR1
+  trap 'rearm=1' USR2
   trap 'kill $root $win $rr 2>/dev/null; exit' TERM EXIT
+  _xev() { have xev && { xev -root -event randr >&3 2>/dev/null & rr=$!; }; }
   xprop -root -spy -notype _NET_ACTIVE_WINDOW >&3 2>/dev/null & root=$!
-  have xev && { xev -root -event randr >&3 2>/dev/null & rr=$!; }
+  _xev
   while :; do
     if read -r -t 10 line <&3; then
       case $line in
         _NET_ACTIVE_WINDOW*)
           a=${line#*# }; a=${a%%,*}; s=
           [ -n "$win" ] && kill "$win" 2>/dev/null; win=
-          [[ $a == 0x* && $a != 0x0 ]] && { xprop -id "$a" -spy -notype _NET_WM_STATE >&3 2>/dev/null & win=$!; } ;;
+          # decide when the new window's state arrives, not before: no resume/pause flicker between two maximized windows
+          [[ $a == 0x* && $a != 0x0 ]] && { xprop -id "$a" -spy -notype _NET_WM_STATE >&3 2>/dev/null & win=$!; continue; } ;;
         _NET_WM_STATE*) s=$line ;;
-        RRScreenChangeNotify*)  # a change comes as several events: act once. restore replaces this watcher
+        RRScreenChangeNotify*)  # a change comes as several events: act once. restore replaces this watcher;
+          # if it fails instead (the -o monitor was unplugged), USR2 makes this one listen again
           [ -n "$rr" ] && { kill "$rr" 2>/dev/null; rr=''
-            setsid sh -c 'sleep 2; exec "$0" restore' "$SELF" </dev/null >/dev/null 2>&1 & } ;;
+            setsid sh -c 'sleep 2; "$0" restore || kill -USR2 "$1"' "$SELF" $$ </dev/null >/dev/null 2>&1 & } ;;
       esac
-    else  # timeout or USR1
+    else  # timeout, USR1 or USR2
+      [ -z "$rearm" ] || { rearm=; [ -n "$rr" ] || _xev; }
       alive=0; _alive() { kill -0 "$pid" 2>/dev/null && alive=1; }; each _alive
       [ $alive = 1 ] || { stop; exit; }
       off=0; xset q 2>/dev/null | grep -q 'Monitor is Off' && off=1
@@ -164,6 +171,11 @@ monitors() {  # name w h x y
   xrandr --listmonitors 2>/dev/null | awk 'NR>1{split($3,g,/[\/x+]/); print $NF, g[1], g[3], g[5], g[6]}'
 }
 
+win_geometry() {  # w h x y, empty when the window is gone
+  xwininfo -id "$1" 2>/dev/null | awk '/Absolute upper-left X:/{x=$NF} /Absolute upper-left Y:/{y=$NF}
+    /^ *Width:/{w=$NF} /^ *Height:/{h=$NF} END{if (w) print w, h, x, y}'
+}
+
 has_desktop() {  # a file manager owns a desktop window (xfdesktop, caja, nemo...)
   local w
   for w in $(xprop -root _NET_CLIENT_LIST_STACKING 2>/dev/null | sed 's/.*#//; s/,/ /g' | awk '{for(i=1;i<=NF&&i<=3;i++)print $i}'); do
@@ -180,9 +192,12 @@ xfkeys() {  # backdrop property of every monitor/workspace: xfkeys image-style
 }
 xfset() { xfconf-query -c xfce4-desktop -p "$1" -s "$2" 2>/dev/null || xfconf-query -c xfce4-desktop -p "$1" -n -t "$3" -s "$2"; }
 
-native_image() {  # XFCE shows a still image itself: zero resident cost
+native_image() {  # native_image FILE [MONITOR]. XFCE shows a still image itself: zero resident cost
   local k s; s=$(case $FIT in (fit) echo 4;; (stretch) echo 3;; (*) echo 5;; esac)
-  for k in $(xfkeys last-image); do xfset "$k" "$1" string; xfset "${k%last-image}image-style" "$s" int; done
+  for k in $(xfkeys last-image); do
+    [ -z "${2:-}" ] || [[ $k == */monitor$2/* ]] || continue
+    xfset "$k" "$1" string; xfset "${k%last-image}image-style" "$s" int
+  done
 }
 
 # xfdesktop paints its icons on an opaque window. Restarted with an RGBA visual (a tiny LD_PRELOAD shim)
@@ -231,14 +246,16 @@ wl_helper() {  # prints the helper path, building it on first use and again when
  * Builds with gcc alone: the few wayland/EGL/libmpv declarations it needs are written out here,
  * so no -dev packages are required, only the runtime libraries every Wayland desktop with mpv has.
  *   lowpaper-wl --list                          print output names
- *   lowpaper-wl OUTPUT [--nopause] [--restore-with=LOWPAPER] [--mpv-option=value]... FILE
+ *   lowpaper-wl OUTPUT [--nopause] [--restore-with=LOWPAPER] [--paused-flag=FILE] [--mpv-option=value]... FILE
  * Hidden-wallpaper pause: the compositor stops sending frame callbacks to a surface nobody can see.
+ *   While FILE exists the user has paused by hand, and becoming visible again does not resume.
  * Monitor hotplug: with --restore-with, an output appearing or disappearing runs `LOWPAPER restore`. */
 #include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -309,7 +326,8 @@ uint64_t mpv_render_context_update(mpv_render_context *);
 #define MAXOUT 16
 static struct { struct wl_proxy *p; uint32_t id; char name[64]; int scale; } out[MAXOUT];
 static int nout, cur = -1, ready, changed, wakefd[2], width, height, scale = 1, configured, dirty, autopaused, nopause, hwdec;
-static const char *restore_with;
+static const char *restore_with, *paused_flag;
+static pid_t restorer;
 static struct wl_display *dpy;
 static struct wl_proxy *compositor, *shell, *surface, *callback;
 static struct wl_egl_window *ewin;
@@ -320,20 +338,23 @@ static double cb_since;  /* when the pending frame callback was requested */
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
 static void die(const char *m) { fprintf(stderr, "lowpaper-wl: %s\n", m); exit(1); }
 
+static void outputs_changed(void) {  /* let lowpaper lay the wallpaper out again, once things settle */
+  if (!restore_with || changed) return;
+  changed = 1;
+  if ((restorer = fork()) == 0) { setsid(); execl("/bin/sh", "sh", "-c", "sleep 2; exec \"$0\" restore", restore_with, (char *)NULL); _exit(1); }
+}
+
 static void o_geometry(void *d, struct wl_proxy *o, int x, int y, int pw, int ph, int sp, const char *mk, const char *md, int t) {}
 static void o_mode(void *d, struct wl_proxy *o, uint32_t f, int w, int h, int r) {}
 static void o_done(void *d, struct wl_proxy *o) {}
-static void o_scale(void *d, struct wl_proxy *o, int s) { out[(intptr_t)d].scale = s; }
+static void o_scale(void *d, struct wl_proxy *o, int s) {
+  out[(intptr_t)d].scale = s;
+  if (ready && (intptr_t)d == cur && s != scale) outputs_changed();  /* a new scale needs a new surface */
+}
 static void o_name(void *d, struct wl_proxy *o, const char *n) { snprintf(out[(intptr_t)d].name, 64, "%s", n); }
 static void o_desc(void *d, struct wl_proxy *o, const char *n) {}
 static void (*out_l[])() = { (void (*)())o_geometry, (void (*)())o_mode, (void (*)())o_done, (void (*)())o_scale,
                              (void (*)())o_name, (void (*)())o_desc };
-
-static void outputs_changed(void) {  /* let lowpaper lay the wallpaper out again, once things settle */
-  if (!restore_with || changed) return;
-  changed = 1;
-  if (fork() == 0) { setsid(); execl("/bin/sh", "sh", "-c", "sleep 2; exec \"$0\" restore", restore_with, (char *)NULL); _exit(1); }
-}
 
 static void g_add(void *d, struct wl_proxy *reg, uint32_t id, const char *iface, uint32_t ver) {
   const struct wl_interface *i = NULL; uint32_t v = 1;
@@ -367,7 +388,8 @@ static void paused_by_us(int on) {
 }
 static void f_done(void *d, struct wl_proxy *cb, uint32_t t) {
   wl_proxy_destroy(cb); callback = NULL;
-  if (autopaused) paused_by_us(0);  /* seen again */
+  if (!autopaused) return;  /* seen again: resume, unless the user paused by hand meanwhile */
+  if (paused_flag && !access(paused_flag, F_OK)) autopaused = 0; else paused_by_us(0);
 }
 static void (*frame_l[])() = { (void (*)())f_done };
 
@@ -408,6 +430,7 @@ int main(int argc, char **argv) {
     if (strncmp(a, "--", 2)) { file = a; continue; }
     if (!strncmp(a, "--playlist=", 11)) { list = a + 11; continue; }
     if (!strncmp(a, "--restore-with=", 15)) { restore_with = a + 15; continue; }
+    if (!strncmp(a, "--paused-flag=", 14)) { paused_flag = a + 14; continue; }
     snprintf(k, sizeof k, "%s", a + 2); eq = strchr(k, '=');
     const char *v = "yes"; if (eq) *eq = 0, v = eq + 1;
     else if (!strncmp(k, "no-", 3)) memmove(k, k + 3, strlen(k + 3) + 1), v = "no";
@@ -461,7 +484,9 @@ int main(int argc, char **argv) {
   for (;;) {
     while (wl_display_prepare_read(dpy)) wl_display_dispatch_pending(dpy);
     wl_display_flush(dpy);
-    poll(pf, 2, callback ? 500 : -1);
+    poll(pf, 2, callback ? 500 : changed ? 2000 : -1);
+    /* a finished restore that left us running has failed (the -o output is gone): watch for the next change */
+    if (changed && waitpid(restorer, NULL, WNOHANG) == restorer) changed = 0;
     if (pf[0].revents & POLLIN) { if (wl_display_read_events(dpy) < 0) return 0; }
     else wl_display_cancel_read(dpy);
     if (pf[0].revents & (POLLERR | POLLHUP)) return 0;
@@ -498,20 +523,23 @@ hwdec_probe() {  # merely probing hwdec costs ~50MB RSS even when it fails, so t
 }
 
 frame_cache() {  # a short loop fits in RAM: decode it once, then replay the frames (mpv CPU -85%)
-  local d r w h fr
+  local d r w h pf fr b=3  # b: bytes per pixel, doubled (yuv420p = 1.5)
   [ "$CACHE_MB" -gt 0 ] || return 1
-  read -r _ d r w h < <(mpv --no-config --vo=null --aid=no --frames=1 \
-    --term-playing-msg='wpprobe ${=duration} ${=container-fps} ${=width} ${=height}' "$1" 2>/dev/null | grep ^wpprobe)
+  read -r _ d r w h pf < <(mpv --no-config --vo=null --aid=no --frames=1 \
+    --term-playing-msg='wpprobe ${=duration} ${=container-fps} ${=width} ${=height} ${=video-params/pixelformat}' "$1" 2>/dev/null | grep ^wpprobe)
   [[ ${w:-} =~ ^[0-9]+$ ]] || return 1
+  case ${pf:-} in *p10*|*p12*|*p16*|p010*) b=6 ;; esac  # 10-bit and deeper: two bytes per sample
+  [[ ${1,,} == *.gif ]] && b=8                          # gif decodes to 4 bytes per pixel
   fr=$(awk -v d="$d" -v r="$r" 'BEGIN{print int(d*r*1.1)+5}')  # unknown fps/duration -> 5 -> no cache
-  [ "$fr" -gt 5 ] && [ $((fr * w * h * 3 / 2 / 1048576)) -le "$CACHE_MB" ] || return 1
+  [ "$fr" -gt 5 ] && [ $((fr * w * h * b / 2 / 1048576)) -le "$CACHE_MB" ] || return 1
   echo "--vf=lavfi=[loop=loop=-1:size=$fr]"
 }
 
 set_wallpaper() {  # [options] FILE|DIR...
-  local out='' mpvonly=0 a f n abs=() fo fit last
+  local out='' mpvonly=0 a f n abs=() fo fit last bad=0
   have flock && { exec 9>"$RUN/lock"; flock 9; }  # one at a time (a hotplug restore can meet a user command)
   while [ $# -gt 0 ]; do case $1 in
+    -f|--fit|-i|--interval|-o|--output) [ $# -gt 1 ] || die "$1 needs a value (see: lowpaper help)" ;;&
     -f|--fit) FIT=$2; shift 2 ;;
     -i|--interval) INTERVAL=$2; shift 2 ;;
     -s|--shuffle) SHUFFLE=1; shift ;;
@@ -525,6 +553,7 @@ set_wallpaper() {  # [options] FILE|DIR...
   [ $# -gt 0 ] || die "need a file or folder"
   have mpv || die "mpv is required"
   fit=$(fit_opts "$FIT") || die "--fit must be fill|fit|stretch"; read -r -a fo <<< "$fit"
+  [[ $INTERVAL =~ ^[0-9]+([.][0-9]+)?$ ]] || die "--interval must be a number of seconds"
   if [ -n "$out" ]; then  # check before stopping the current wallpaper or touching `last`
     local names
     if [ -n "${WAYLAND_DISPLAY:-}" ]; then local wl; wl=$(wl_helper) || exit 1; names=$("$wl" --list) || exit 1
@@ -536,7 +565,7 @@ set_wallpaper() {  # [options] FILE|DIR...
   for a in "$@"; do
     a=$(readlink -f -- "$a") || die "not found: $a"; abs+=("$a")
     if [ -d "$a" ]; then
-      find "$a" -type f | sort | while read -r f; do is_media "$f" && echo "$f"; done >> "$LIST.new"
+      find -L "$a" -type f | sort | while IFS= read -r f; do is_media "$f" && echo "$f"; done >> "$LIST.new"
     elif [ -f "$a" ]; then echo "$a" >> "$LIST.new"
     else die "not found: $a"; fi
   done
@@ -548,15 +577,22 @@ set_wallpaper() {  # [options] FILE|DIR...
   printf '%q ' "${last[@]}" -- "${abs[@]}" > "$CFG/last"
 
   if [ "$n" = 1 ] && is_image "$f" && [ $mpvonly = 0 ] && [ -z "${WAYLAND_DISPLAY:-}" ] && xfce; then
-    stop; native_image "$f"
+    stop; native_image "$f" "$out"
     echo "Set as desktop image (shown by XFCE, nothing kept running): $f"; return
   fi
+  if [ -z "${WAYLAND_DISPLAY:-}" ]; then  # checked before the current wallpaper is stopped
+    [ -n "${DISPLAY:-}" ] || die "no graphical session (DISPLAY is empty)"
+    for a in python3 xrandr xprop xkill xwininfo; do have "$a" || die "X11 needs $a"; done
+  fi
+  # mpv before 0.36 has no fast profile, and refuses to start when asked for one; asked once per session
+  [ -f "$RUN/fast" ] || { mpv --no-config --profile=help 2>/dev/null | grep -qw fast; echo $? > "$RUN/fast"; }
   stop keep
 
   local opts=(--no-config --terminal=yes --input-terminal=no --msg-level=all=warn --msg-color=no --term-osd=no --osc=no --osd-level=0 --load-scripts=no --ytdl=no
     --input-default-bindings=no --input-vo-keyboard=no --cursor-autohide=always --stop-screensaver=no
-    --sid=no --profile=fast --framedrop=vo --cache=no --demuxer-max-bytes=4MiB --demuxer-max-back-bytes=0
+    --sid=no --framedrop=vo --cache=no --demuxer-max-bytes=4MiB --demuxer-max-back-bytes=0
     --panscan="${fo[0]}" --keepaspect="${fo[1]}")
+  [ "$(cat "$RUN/fast")" = 0 ] && opts+=(--profile=fast)
   [ $AUDIO = 1 ] || opts+=(--aid=no)
   [ $SHUFFLE = 1 ] && opts+=(--shuffle)
   if [ "$n" -gt 1 ]; then opts+=(--loop-playlist=inf --image-display-duration="$INTERVAL"); set -- --playlist="$LIST"
@@ -575,34 +611,36 @@ set_wallpaper() {  # [options] FILE|DIR...
     : > "$STATE"
     for name in $outs; do
       [ -z "$out" ] || [ "$out" = "$name" ] || continue
-      setsid "$wl" "$name" ${np:+"$np"} ${lead:+"$lead"} "${opts[@]}" \
-        --input-ipc-server="$RUN/$name.sock" "$@" </dev/null >"$RUN/$name.log" 2>&1 9>&- &
+      # a socket name of its own: the instance being replaced removes its socket as it exits
+      setsid "$wl" "$name" ${np:+"$np"} ${lead:+"$lead"} --paused-flag="$RUN/paused" "${opts[@]}" \
+        --input-ipc-server="$RUN/$name.$$.sock" "$@" </dev/null >"$RUN/$name.log" 2>&1 9>&- &
       lead=  # one helper is enough to notice a monitor change
-      echo "$name $! - $RUN/$name.sock" >> "$STATE"
+      echo "$name $! - $RUN/$name.$$.sock" >> "$STATE"
     done
     [ -s "$STATE" ] || die "output not found: ${out} (outputs: $(echo $outs))"
   else
-    [ -n "${DISPLAY:-}" ] || die "no graphical session (DISPLAY is empty)"
-    have python3 || die "X11 needs python3"
     local name w h x y wid sock so new= ; local -A old
     [ -s "$STATE" ] && while read -r name _ wid _; do old[$name]=$wid; done < "$STATE"
     : > "$STATE"
     so=$(icons_shim) && backdrop_clear
     while read -r name w h x y; do
       [ -z "$out" ] || [ "$out" = "$name" ] || continue
-      wid=${old[$name]:-}; unset "old[$name]"
-      [ -n "$wid" ] && xwininfo -id "$wid" >/dev/null 2>&1 \
-        || { wid=$(py win "$x" "$y" "$w" "$h" ${so:+under}) || die "could not create window"; new=new; }
-      sock=$RUN/$name.sock
+      wid=${old[$name]:-}  # keep the window only if it still covers the monitor (not after a resize or a move)
+      if [ -n "$wid" ] && [ "$(win_geometry "$wid")" = "$w $h $x $y" ]; then unset "old[$name]"
+      else wid=$(py win "$x" "$y" "$w" "$h" ${so:+under}) || die "could not create window"; new=new; fi
+      sock=$RUN/$name.$$.sock
       setsid mpv "${opts[@]}" --vo=xv,gpu,x11 --wid="$wid" --input-ipc-server="$sock" "$@" </dev/null >"$RUN/$name.log" 2>&1 9>&- &
       echo "$name $! $wid $sock" >> "$STATE"
     done < <(monitors)
-    for wid in "${old[@]}"; do xkill -id "$wid" >/dev/null 2>&1; done
+    for wid in ${old[@]+"${old[@]}"}; do xkill -id "$wid" >/dev/null 2>&1; done
     [ -s "$STATE" ] || die "monitor not found: ${out}"
     [ -n "$so" ] && xfdesktop_over "$so" $new
     setsid "$SELF" _watch </dev/null >/dev/null 2>&1 9>&- &
     echo $! > "$RUN/watch.pid"  # now, so a stop right after this cannot miss it
   fi
+  sleep 0.5  # a wrong option, an unreadable file or an unsupported compositor ends it at once: say so
+  _up() { kill -0 "$pid" 2>/dev/null || { echo "lowpaper: $name failed to start:" >&2; tail -n 5 "$RUN/$name.log" >&2; bad=1; }; }
+  each _up; [ $bad = 0 ] || exit 1
   echo "Wallpaper started ($n file(s)): $f"
 }
 
@@ -622,7 +660,7 @@ restore() {  # used by autostart: wait for the desktop to come up, then re-apply
 startup() {
   case ${1:-} in
     on) mkdir -p "${AUTOSTART%/*}"
-        printf '[Desktop Entry]\nType=Application\nName=lowpaper\nExec=%s restore\nNoDisplay=true\nX-GNOME-Autostart-enabled=true\n' "$SELF" > "$AUTOSTART"
+        printf '[Desktop Entry]\nType=Application\nName=lowpaper\nExec="%s" restore\nNoDisplay=true\nX-GNOME-Autostart-enabled=true\n' "$SELF" > "$AUTOSTART"
         echo "autostart on (Sway/Hyprland: add \"exec $SELF restore\" to your config)" ;;
     off) rm -f "$AUTOSTART"; echo "autostart off" ;;
     *) [ -f "$AUTOSTART" ] && echo on || echo off ;;
